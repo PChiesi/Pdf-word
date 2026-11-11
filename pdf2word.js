@@ -112,7 +112,7 @@
   }
 
   // ---------------------------------------------------------------------
-  // 1) Leitura de uma página: texto, cores, linhas e áreas gráficas
+  // 1) Leitura de uma página: texto, cores, desenhos, tabelas e figuras
   // ---------------------------------------------------------------------
   async function lerPagina(page, num) {
     const vp = page.getViewport({ scale: 1 });
@@ -123,7 +123,6 @@
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
     await page.render({ canvasContext: ctx, viewport: page.getViewport({ scale: S }) }).promise;
-    const previa = canvas;
 
     const tc = await page.getTextContent();
     let itens = [];
@@ -137,30 +136,383 @@
       const desc = est.descent && est.descent < 0 ? -est.descent : 0.2;
       const largura = it.width > 0 ? it.width : tam * it.str.length * 0.5;
       const base = { str: it.str, x: t[4], base: t[5], tam, largura, topo: t[5] - tam * asc, fundo: t[5] + tam * desc, fonte: infoFonte(page, it.fontName, est) };
+      if (base.x > W || base.x + largura < 0 || base.fundo < 0 || base.topo > H) continue; // fora da página
       itens.push(...dividirLider(base));
     }
 
-    // Cores do texto e do fundo; depois "apaga" o texto da imagem
-    const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const orig = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const pad = 1.5;
     for (const it of itens) {
-      const a = analisarCaixa(img.data, canvas.width, canvas.height, it.x * S, it.topo * S - pad, (it.x + it.largura) * S, it.fundo * S + pad);
+      const a = analisarCaixa(orig.data, canvas.width, canvas.height, it.x * S, it.topo * S - pad, (it.x + it.largura) * S, it.fundo * S + pad);
       it.cor = a ? hex(a.cor) : '000000';
       it.fundoCor = a ? a.fundo : [255, 255, 255];
     }
-    const copia = document.createElement('canvas');
-    copia.width = canvas.width; copia.height = canvas.height;
-    const cc = copia.getContext('2d', { willReadFrequently: true });
-    cc.drawImage(canvas, 0, 0);
+
+    // Desenhos vetoriais e imagens, lidos dos comandos do PDF
+    const ops = await page.getOperatorList();
+    const G = analisarOperadores(ops, vp.transform, W, H);
+    marcarSublinhados(G, itens);
+    const tabelas = detectarGrades(G, itens);
+    const { figuras, enfeites } = agruparGraficos(G, itens, tabelas, W, H);
+
+    // Distribui o texto: figura (fica na imagem), tabela (vai para a célula) ou corpo
+    const dentro = (it, b, tol = 1.5) => {
+      const cx = it.x + it.largura / 2, cy = (it.topo + it.fundo) / 2;
+      return cx >= b.x0 - tol && cx <= b.x1 + tol && cy >= b.y0 - tol && cy <= b.y1 + tol;
+    };
+    const corpo = [];
     for (const it of itens) {
-      cc.fillStyle = `rgb(${it.fundoCor.map(Math.round).join(',')})`;
-      cc.fillRect(it.x * S - pad, it.topo * S - pad, it.largura * S + 2 * pad, (it.fundo - it.topo) * S + 2 * pad);
+      const fig = figuras.find((f) => dentro(it, f, 2));
+      if (fig) { it.naFigura = true; continue; }
+      const tab = tabelas.find((t) => dentro(it, t));
+      if (tab) {
+        const cel = tab.celulas.find((c) => dentro(it, { x0: tab.x[c.c], x1: tab.x[c.c + c.cs], y0: tab.y[c.r], y1: tab.y[c.r + c.rs] }, 0.5));
+        if (cel) { cel.itens.push(it); continue; }
+      }
+      corpo.push(it);
     }
 
-    const linhas = agruparLinhas(itens);
-    const graficos = await areasGraficas(copia, S, W, H);
+    // Cópia sem o texto (para os enfeites e o fundo das células)
+    const limpa = document.createElement('canvas');
+    limpa.width = canvas.width; limpa.height = canvas.height;
+    const lc = limpa.getContext('2d', { willReadFrequently: true });
+    lc.drawImage(canvas, 0, 0);
+    for (const it of itens) {
+      if (it.naFigura) continue;
+      lc.fillStyle = `rgb(${it.fundoCor.map(Math.round).join(',')})`;
+      lc.fillRect(it.x * S - pad, it.topo * S - pad, it.largura * S + 2 * pad, (it.fundo - it.topo) * S + 2 * pad);
+    }
+    const limpos = lc.getImageData(0, 0, limpa.width, limpa.height);
+
+    for (const T of tabelas) prepararGrade(T, limpos, orig, S, canvas.width, canvas.height);
+    for (const f of figuras) f.bytes = await recortar(canvas, orig, S, f, false);
+    for (const e of enfeites) e.bytes = await recortar(limpa, limpos, S, e, true);
+
+    const linhas = agruparLinhas(corpo);
     page.cleanup();
-    return { num, W, H, linhas, graficos, previa, temTexto: itens.length > 0 };
+    return {
+      num, W, H, linhas, previa: canvas, temTexto: itens.length > 0,
+      tabelas: tabelas.filter((t) => t.celulas.some((c) => c.itens.length) || t.celulas.length > 1),
+      figuras: figuras.filter((f) => f.bytes), enfeites: enfeites.filter((e) => e.bytes),
+    };
+  }
+
+  // Lê os comandos de desenho: linhas retas, retângulos, curvas e imagens
+  function analisarOperadores(lista, vpT, W, H) {
+    const OPS = pdfjsLib.OPS;
+    const fn = lista.fnArray, args = lista.argsArray;
+    let ctm = vpT.slice(), lw = 1;
+    const pilha = [];
+    const G = { hs: [], vs: [], rets: [], desenhos: [], imagens: [], fundoPagina: false };
+    let cam = null;
+    const T = (x, y) => [ctm[0] * x + ctm[2] * y + ctm[4], ctm[1] * x + ctm[3] * y + ctm[5]];
+    const novoCam = () => ({ rets: [], segs: [], curva: false, pts: [], ini: null, atual: null });
+    const caixa = (pts) => {
+      let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+      for (const [x, y] of pts) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
+      return { x0, y0, x1, y1 };
+    };
+    const naPagina = (b) => b.x1 > 0 && b.y1 > 0 && b.x0 < W && b.y0 < H;
+    const linhaH = (y, x0, x1, e) => G.hs.push({ y, x0: Math.min(x0, x1), x1: Math.max(x0, x1), e });
+    const linhaV = (x, y0, y1, e) => G.vs.push({ x, y0: Math.min(y0, y1), y1: Math.max(y0, y1), e });
+
+    function pintar(preenche, contorna) {
+      if (!cam) return;
+      const escala = Math.sqrt(Math.abs(ctm[0] * ctm[3] - ctm[1] * ctm[2])) || 1;
+      const e = Math.max(0.3, lw * escala);
+      for (const r of cam.rets) {
+        if (!naPagina(r)) continue;
+        const w = r.x1 - r.x0, h = r.y1 - r.y0;
+        if (preenche) {
+          if (h <= 3 && w > 3 * h) linhaH((r.y0 + r.y1) / 2, r.x0, r.x1, Math.max(h, 0.3));
+          else if (w <= 3 && h > 3 * w) linhaV((r.x0 + r.x1) / 2, r.y0, r.y1, Math.max(w, 0.3));
+          else if (w > 0.5 && h > 0.5) {
+            if (w * h > W * H * 0.85) G.fundoPagina = true;
+            else G.rets.push({ ...r });
+          }
+        }
+        if (contorna) {
+          if (h < 0.5) linhaH(r.y0, r.x0, r.x1, e);
+          else if (w < 0.5) linhaV(r.x0, r.y0, r.y1, e);
+          else { linhaH(r.y0, r.x0, r.x1, e); linhaH(r.y1, r.x0, r.x1, e); linhaV(r.x0, r.y0, r.y1, e); linhaV(r.x1, r.y0, r.y1, e); }
+        }
+      }
+      if (cam.segs.length || cam.curva) {
+        const todos = cam.pts;
+        const b = caixa(todos);
+        if (naPagina(b)) {
+          const retos = cam.segs.every((s) => Math.abs(s[1] - s[3]) < 0.8 || Math.abs(s[0] - s[2]) < 0.8);
+          if (cam.curva || !retos) G.desenhos.push(b);
+          else if (contorna) {
+            for (const s of cam.segs) {
+              if (Math.abs(s[1] - s[3]) < 0.8 && Math.abs(s[0] - s[2]) >= 0.8) linhaH((s[1] + s[3]) / 2, s[0], s[2], e);
+              else if (Math.abs(s[0] - s[2]) < 0.8 && Math.abs(s[1] - s[3]) >= 0.8) linhaV((s[0] + s[2]) / 2, s[1], s[3], e);
+            }
+          }
+          if (!cam.curva && retos && preenche) {
+            const w = b.x1 - b.x0, h = b.y1 - b.y0;
+            if (h <= 3 && w > 3 * h) linhaH((b.y0 + b.y1) / 2, b.x0, b.x1, Math.max(h, 0.3));
+            else if (w <= 3 && h > 3 * w) linhaV((b.x0 + b.x1) / 2, b.y0, b.y1, Math.max(w, 0.3));
+            else if (w > 0.5 && h > 0.5) { if (w * h > W * H * 0.85) G.fundoPagina = true; else G.rets.push(b); }
+          }
+        }
+      }
+      cam = null;
+    }
+
+    for (let i = 0; i < fn.length; i++) {
+      const f = fn[i], a = args[i];
+      switch (f) {
+        case OPS.save: pilha.push([ctm, lw]); break;
+        case OPS.restore: if (pilha.length) [ctm, lw] = pilha.pop(); break;
+        case OPS.transform: ctm = pdfjsLib.Util.transform(ctm, a); break;
+        case OPS.setLineWidth: lw = a[0]; break;
+        case OPS.paintFormXObjectBegin: pilha.push([ctm, lw]); if (a && a[0]) ctm = pdfjsLib.Util.transform(ctm, a[0]); break;
+        case OPS.paintFormXObjectEnd: if (pilha.length) [ctm, lw] = pilha.pop(); break;
+        case OPS.constructPath: {
+          if (!cam) cam = novoCam();
+          const ops = a[0], c = a[1];
+          let j = 0;
+          for (let k = 0; k < ops.length; k++) {
+            switch (ops[k] | 0) {
+              case OPS.rectangle: {
+                const x = c[j++], y = c[j++], w = c[j++], h = c[j++];
+                const p = [T(x, y), T(x + w, y), T(x + w, y + h), T(x, y + h)];
+                cam.pts.push(...p);
+                const reto = Math.abs(ctm[1]) < 1e-6 && Math.abs(ctm[2]) < 1e-6 || Math.abs(ctm[0]) < 1e-6 && Math.abs(ctm[3]) < 1e-6;
+                if (reto) cam.rets.push(caixa(p));
+                else { cam.segs.push([...p[0], ...p[1]], [...p[1], ...p[2]], [...p[2], ...p[3]], [...p[3], ...p[0]]); }
+                break;
+              }
+              case OPS.moveTo: { const p = T(c[j++], c[j++]); cam.ini = p; cam.atual = p; cam.pts.push(p); break; }
+              case OPS.lineTo: {
+                const p = T(c[j++], c[j++]);
+                if (cam.atual) cam.segs.push([...cam.atual, ...p]);
+                cam.atual = p; cam.pts.push(p); break;
+              }
+              case OPS.curveTo: { cam.pts.push(T(c[j], c[j + 1]), T(c[j + 2], c[j + 3])); const p = T(c[j + 4], c[j + 5]); j += 6; cam.curva = true; cam.atual = p; cam.pts.push(p); break; }
+              case OPS.curveTo2: case OPS.curveTo3: { cam.pts.push(T(c[j], c[j + 1])); const p = T(c[j + 2], c[j + 3]); j += 4; cam.curva = true; cam.atual = p; cam.pts.push(p); break; }
+              case OPS.closePath: if (cam.atual && cam.ini) cam.segs.push([...cam.atual, ...cam.ini]); cam.atual = cam.ini; break;
+              default: break;
+            }
+          }
+          break;
+        }
+        case OPS.fill: case OPS.eoFill: pintar(true, false); break;
+        case OPS.stroke: case OPS.closeStroke: pintar(false, true); break;
+        case OPS.fillStroke: case OPS.eoFillStroke: case OPS.closeFillStroke: case OPS.closeEOFillStroke: pintar(true, true); break;
+        case OPS.endPath: cam = null; break;
+        case OPS.paintImageXObject: case OPS.paintInlineImageXObject: case OPS.paintImageMaskXObject: case OPS.paintSolidColorImageMask: {
+          const b = caixa([T(0, 0), T(1, 0), T(1, 1), T(0, 1)]);
+          if (naPagina(b) && (b.x1 - b.x0) > 1 && (b.y1 - b.y0) > 1) {
+            if ((b.x1 - b.x0) * (b.y1 - b.y0) > W * H * 0.85) G.fundoPagina = true;
+            G.imagens.push({ x0: Math.max(0, b.x0), y0: Math.max(0, b.y0), x1: Math.min(W, b.x1), y1: Math.min(H, b.y1) });
+          }
+          break;
+        }
+        default: break;
+      }
+    }
+    G.hs = juntarLinhas(G.hs, 'y', 'x0', 'x1');
+    G.vs = juntarLinhas(G.vs, 'x', 'y0', 'y1');
+    return G;
+  }
+
+  // Junta pedaços de linha alinhados e encostados (bordas desenhadas célula a célula)
+  function juntarLinhas(ls, eixo, a, b) {
+    ls = ls.filter((l) => l[b] - l[a] > 1).sort((p, q) => p[eixo] - q[eixo] || p[a] - q[a]);
+    const out = [];
+    for (const l of ls) {
+      const m = out.find((o) => Math.abs(o[eixo] - l[eixo]) <= 1.2 && l[a] <= o[b] + 1.5 && l[b] >= o[a] - 1.5);
+      if (m) { m[a] = Math.min(m[a], l[a]); m[b] = Math.max(m[b], l[b]); m.e = Math.max(m.e, l.e); }
+      else out.push({ ...l });
+    }
+    return out;
+  }
+
+  // Linha fina logo abaixo de um texto = sublinhado (vira formatação, não desenho)
+  function marcarSublinhados(G, itens) {
+    G.hs = G.hs.filter((h) => {
+      if (h.e > 1.6) return true;
+      const alvo = itens.filter((it) => h.y >= it.base - 0.5 && h.y <= it.base + 0.3 * it.tam
+        && it.x >= h.x0 - 1.5 && it.x + it.largura <= h.x1 + 1.5);
+      if (!alvo.length) return true;
+      const cob = alvo.reduce((s, it) => s + it.largura, 0);
+      if (cob < (h.x1 - h.x0) * 0.6) return true;
+      alvo.forEach((it) => { it.sublinhado = true; });
+      return false;
+    });
+  }
+
+  const agrupar = (vals, tol) => {
+    const s = [...vals].sort((a, b) => a - b), out = [];
+    for (const v of s) { const u = out[out.length - 1]; if (u && v - u.max <= tol) { u.max = v; u.soma += v; u.n++; } else out.push({ max: v, soma: v, n: 1 }); }
+    return out.map((g) => g.soma / g.n);
+  };
+
+  // Tabelas com linhas de grade
+  function detectarGrades(G, itens) {
+    const hs = G.hs, vs = G.vs;
+    const n = hs.length + vs.length;
+    if (hs.length < 2 || vs.length < 2) return [];
+    const pai = [...Array(n).keys()];
+    const raiz = (i) => (pai[i] === i ? i : (pai[i] = raiz(pai[i])));
+    for (let i = 0; i < hs.length; i++) for (let j = 0; j < vs.length; j++) {
+      const h = hs[i], v = vs[j];
+      if (v.x >= h.x0 - 2.5 && v.x <= h.x1 + 2.5 && h.y >= v.y0 - 2.5 && h.y <= v.y1 + 2.5) pai[raiz(i)] = raiz(hs.length + j);
+    }
+    const grupos = new Map();
+    for (let i = 0; i < n; i++) { const r = raiz(i); if (!grupos.has(r)) grupos.set(r, { hs: [], vs: [] }); (i < hs.length ? grupos.get(r).hs : grupos.get(r).vs).push(i < hs.length ? hs[i] : vs[i - hs.length]); }
+    const tabelas = [];
+    for (const g of grupos.values()) {
+      if (g.hs.length < 2 || g.vs.length < 2) continue;
+      const x0 = Math.min(...g.hs.map((h) => h.x0)), x1 = Math.max(...g.hs.map((h) => h.x1));
+      const y0 = Math.min(...g.vs.map((v) => v.y0)), y1 = Math.max(...g.vs.map((v) => v.y1));
+      const xs = agrupar([x0, x1, ...g.vs.map((v) => v.x)], 3);
+      const ys = agrupar([y0, y1, ...g.hs.map((h) => h.y)], 3);
+      if (xs.length < 2 || ys.length < 2) continue;
+      const cobre = (lista, eixo, pos, a, b, ini, fim) => {
+        let tot = 0;
+        for (const l of lista) if (Math.abs(l[eixo] - pos) <= 2.5) tot += Math.max(0, Math.min(fim, l[b]) - Math.max(ini, l[a]));
+        return tot >= (fim - ini) * 0.6;
+      };
+      const temV = (x, ya, yb) => cobre(g.vs, 'x', x, 'y0', 'y1', ya, yb);
+      const temH = (y, xa, xb) => cobre(g.hs, 'y', y, 'x0', 'x1', xa, xb);
+      const nr = ys.length - 1, nc = xs.length - 1;
+      const dono = Array.from({ length: nr }, () => Array(nc).fill(null));
+      const celulas = [];
+      for (let r = 0; r < nr; r++) {
+        for (let c = 0; c < nc; c++) {
+          if (dono[r][c]) continue;
+          let cs = 1;
+          while (c + cs < nc && !dono[r][c + cs] && !temV(xs[c + cs], ys[r], ys[r + 1])) cs++;
+          let rs = 1;
+          while (r + rs < nr && !temH(ys[r + rs], xs[c], xs[c + cs]) && dono[r + rs].slice(c, c + cs).every((d) => !d)) rs++;
+          const cel = { r, c, cs, rs, itens: [] };
+          for (let i = r; i < r + rs; i++) for (let k = c; k < c + cs; k++) dono[i][k] = cel;
+          celulas.push(cel);
+        }
+      }
+      if (celulas.length < 2) continue; // um retângulo só é moldura, não tabela
+      const bordaDe = (lista, eixo, pos, a, b, ini, fim) => {
+        const l = lista.find((x) => Math.abs(x[eixo] - pos) <= 2.5 && Math.min(fim, x[b]) - Math.max(ini, x[a]) >= (fim - ini) * 0.6);
+        return l ? { e: l.e, pos: l[eixo], meio: (Math.max(ini, l[a]) + Math.min(fim, l[b])) / 2 } : null;
+      };
+      for (const c of celulas) {
+        const xa = xs[c.c], xb = xs[c.c + c.cs], ya = ys[c.r], yb = ys[c.r + c.rs];
+        c.bordas = {
+          top: bordaDe(g.hs, 'y', ya, 'x0', 'x1', xa, xb), bottom: bordaDe(g.hs, 'y', yb, 'x0', 'x1', xa, xb),
+          left: bordaDe(g.vs, 'x', xa, 'y0', 'y1', ya, yb), right: bordaDe(g.vs, 'x', xb, 'y0', 'y1', ya, yb),
+        };
+      }
+      g.hs.forEach((h) => { h.usada = true; }); g.vs.forEach((v) => { v.usada = true; });
+      tabelas.push({ tipo: 'grade', x: xs, y: ys, celulas, x0: xs[0], x1: xs[nc], y0: ys[0], y1: ys[nr], comBorda: true });
+    }
+    // Retângulos de fundo dentro da tabela viram cor das células
+    for (const t of tabelas) for (const r of G.rets) {
+      if (r.x0 >= t.x0 - 2 && r.x1 <= t.x1 + 2 && r.y0 >= t.y0 - 2 && r.y1 <= t.y1 + 2) r.usado = true;
+    }
+    return tabelas;
+  }
+
+  // Agrupa os desenhos que sobraram: figuras (imagem, gráfico) ou enfeites (linhas, caixas, faixas)
+  function agruparGraficos(G, itens, tabelas, W, H) {
+    const els = [];
+    for (const b of G.imagens) els.push({ ...b, img: true });
+    for (const b of G.desenhos) els.push({ ...b, des: true });
+    for (const r of G.rets) if (!r.usado) els.push({ ...r, ret: true });
+    for (const h of G.hs) if (!h.usada) els.push({ x0: h.x0, x1: h.x1, y0: h.y - h.e / 2 - 0.5, y1: h.y + h.e / 2 + 0.5, lin: true });
+    for (const v of G.vs) if (!v.usada) els.push({ x0: v.x - v.e / 2 - 0.5, x1: v.x + v.e / 2 + 0.5, y0: v.y0, y1: v.y1, lin: true });
+    // Imagens/desenhos dentro de tabelas ficam soltos (não juntam com a tabela)
+    const perto = (a, b, d) => a.x0 <= b.x1 + d && b.x0 <= a.x1 + d && a.y0 <= b.y1 + d && b.y0 <= a.y1 + d;
+    let grupos = els.map((e) => ({ x0: e.x0, y0: e.y0, x1: e.x1, y1: e.y1, img: !!e.img, des: !!e.des, rets: e.ret ? 1 : 0, area: (e.x1 - e.x0) * (e.y1 - e.y0) }));
+    let mudou = true;
+    while (mudou) {
+      mudou = false;
+      for (let a = 0; a < grupos.length && !mudou; a++) for (let b = a + 1; b < grupos.length; b++) {
+        const A = grupos[a], B = grupos[b];
+        // só junta peças de um mesmo desenho: encostadas, ou uma dentro da outra
+        if (!perto(A, B, 4)) continue;
+        A.x0 = Math.min(A.x0, B.x0); A.y0 = Math.min(A.y0, B.y0); A.x1 = Math.max(A.x1, B.x1); A.y1 = Math.max(A.y1, B.y1);
+        A.img = A.img || B.img; A.des = A.des || B.des; A.rets += B.rets; A.area += B.area;
+        grupos.splice(b, 1); mudou = true; break;
+      }
+    }
+    const figuras = [], enfeites = [];
+    for (const g of grupos) {
+      const w = g.x1 - g.x0, h = g.y1 - g.y0;
+      if (w < 1.5 && h < 1.5) continue;
+      const areaTexto = itens.reduce((s, it) => {
+        const ix = Math.max(0, Math.min(g.x1, it.x + it.largura) - Math.max(g.x0, it.x));
+        const iy = Math.max(0, Math.min(g.y1, it.fundo) - Math.max(g.y0, it.topo));
+        return s + ix * iy;
+      }, 0);
+      const densidade = areaTexto / Math.max(1, w * h);
+      const grande = w * h > W * H * 0.6;
+      const ehFigura = !grande && (g.img || g.des || g.rets >= 3) && densidade < 0.3 && w > 6 && h > 6;
+      (ehFigura ? figuras : enfeites).push({ x0: g.x0, y0: g.y0, x1: g.x1, y1: g.y1, grafico: !g.img && (g.des || g.rets >= 3) });
+    }
+    // Rótulos de gráfico colados no desenho (eixos, categorias) entram na figura
+    for (let volta = 0; volta < 2; volta++) for (const f of figuras) {
+      if (!f.grafico) continue;
+      for (const it of itens) {
+        const dx = Math.max(f.x0 - (it.x + it.largura), it.x - f.x1, 0);
+        const dy = Math.max(f.y0 - it.fundo, it.topo - f.y1, 0);
+        if ((dx > 0 || dy > 0) && dx < 0.8 * it.tam && dy < 0.8 * it.tam && it.str.trim().length <= 24 && it.largura < (f.x1 - f.x0) * 0.5) {
+          f.x0 = Math.min(f.x0, it.x - 1); f.x1 = Math.max(f.x1, it.x + it.largura + 1);
+          f.y0 = Math.min(f.y0, it.topo - 1); f.y1 = Math.max(f.y1, it.fundo + 1);
+        }
+      }
+    }
+    return { figuras, enfeites };
+  }
+
+  // Fundo e bordas das células (cores lidas da página)
+  function prepararGrade(T, limpos, orig, S, cw, ch) {
+    const px = (d, x, y) => { const X = Math.max(0, Math.min(cw - 1, Math.round(x * S))), Y = Math.max(0, Math.min(ch - 1, Math.round(y * S))); const i = (Y * cw + X) * 4; return [d.data[i], d.data[i + 1], d.data[i + 2]]; };
+    for (const c of T.celulas) {
+      const xa = T.x[c.c], xb = T.x[c.c + c.cs], ya = T.y[c.r], yb = T.y[c.r + c.rs];
+      const r = [], g = [], b = [];
+      for (let k = 1; k <= 5; k++) for (let m = 1; m <= 5; m++) {
+        const p = px(limpos, xa + 2 + (xb - xa - 4) * k / 6, ya + 2 + (yb - ya - 4) * m / 6);
+        r.push(p[0]); g.push(p[1]); b.push(p[2]);
+      }
+      const fundo = [mediana(r), mediana(g), mediana(b)];
+      c.fundo = quaseBranco(fundo) ? null : hex(fundo);
+      for (const lado of ['top', 'bottom', 'left', 'right']) {
+        const bd = c.bordas && c.bordas[lado];
+        if (!bd) continue;
+        // cor: o pixel mais escuro sobre a linha
+        let melhor = null;
+        for (let d = -1.5; d <= 1.5; d += 0.5) {
+          const p = lado === 'top' || lado === 'bottom' ? px(orig, bd.meio, bd.pos + d) : px(orig, bd.pos + d, bd.meio);
+          if (!melhor || p[0] + p[1] + p[2] < melhor[0] + melhor[1] + melhor[2]) melhor = p;
+        }
+        bd.cor = hex(melhor);
+      }
+    }
+  }
+
+  // Recorta uma área da página; descarta se estiver vazia (só branco)
+  async function recortar(canvas, dados, S, b, ehEnfeite) {
+    const x0 = Math.max(0, Math.floor((b.x0 - 1) * S)), y0 = Math.max(0, Math.floor((b.y0 - 1) * S));
+    const x1 = Math.min(canvas.width, Math.ceil((b.x1 + 1) * S)), y1 = Math.min(canvas.height, Math.ceil((b.y1 + 1) * S));
+    const w = x1 - x0, h = y1 - y0;
+    if (w < 2 || h < 2) return null;
+    let tinta = 0, total = 0;
+    const passo = Math.max(1, Math.floor(Math.sqrt(w * h / 20000)));
+    for (let y = y0; y < y1; y += passo) for (let x = x0; x < x1; x += passo) {
+      const i = (y * canvas.width + x) * 4; total++;
+      if (765 - dados.data[i] - dados.data[i + 1] - dados.data[i + 2] > 30) tinta++;
+    }
+    if (!tinta || tinta / total < (ehEnfeite ? 0.002 : 0.001)) return null;
+    b.x0 = x0 / S; b.y0 = y0 / S; b.x1 = x1 / S; b.y1 = y1 / S;
+    const rc = document.createElement('canvas');
+    rc.width = w; rc.height = h;
+    rc.getContext('2d').drawImage(canvas, x0, y0, w, h, 0, 0, w, h);
+    const tipo = w * h > 400000 && !ehEnfeite ? 'image/jpeg' : 'image/png';
+    const blob = await new Promise((r) => rc.toBlob(r, tipo, 0.92));
+    return new Uint8Array(await blob.arrayBuffer());
   }
 
   function agruparLinhas(itens) {
@@ -190,6 +542,7 @@
     L.tam = [...porTam.entries()].sort((a, b) => b[1] - a[1])[0][0];
     const principal = L.itens.find((it) => Math.abs(it.tam - L.tam) < 0.6) || L.itens[0];
     L.base = principal.base;
+    L.tamMax = Math.max(...L.itens.filter((i) => !i.sobrescrito).map((i) => i.tam), L.tam);
     L.fonte = principal.fonte;
     for (const it of L.itens) it.sobrescrito = it.tam < L.tam * 0.8 && it.base < L.base - 0.2 * L.tam;
     L.x0 = Math.min(...L.itens.map((i) => i.x));
@@ -217,69 +570,6 @@
       t += it.str; fim = it.x + it.largura;
     }
     return t.replace(/\s+/g, ' ').trim();
-  }
-
-  // Áreas com desenho (imagens, linhas, fundos) depois de apagar o texto
-  async function areasGraficas(canvas, S, W, H) {
-    const cw = canvas.width, ch = canvas.height;
-    const dados = canvas.getContext('2d').getImageData(0, 0, cw, ch).data;
-    const cel = Math.max(2, Math.round(2.5 * S));
-    const gx = Math.ceil(cw / cel), gy = Math.ceil(ch / cel);
-    const grade = new Uint8Array(gx * gy);
-    let marcadas = 0;
-    for (let j = 0; j < gy; j++) for (let i = 0; i < gx; i++) {
-      let tinta = false;
-      const yMax = Math.min(ch, (j + 1) * cel), xMax = Math.min(cw, (i + 1) * cel);
-      for (let y = j * cel; y < yMax && !tinta; y++) for (let x = i * cel; x < xMax; x++) {
-        const k = (y * cw + x) * 4;
-        if (765 - dados[k] - dados[k + 1] - dados[k + 2] > 45) { tinta = true; break; }
-      }
-      if (tinta) { grade[j * gx + i] = 1; marcadas++; }
-    }
-    if (!marcadas) return [];
-    // Componentes conectados
-    const vis = new Uint8Array(gx * gy);
-    let caixas = [];
-    for (let s = 0; s < grade.length; s++) {
-      if (!grade[s] || vis[s]) continue;
-      let x0 = 1e9, y0 = 1e9, x1 = -1, y1 = -1, n = 0;
-      const pilha = [s]; vis[s] = 1;
-      while (pilha.length) {
-        const c = pilha.pop(); const cx = c % gx, cy = (c / gx) | 0; n++;
-        x0 = Math.min(x0, cx); x1 = Math.max(x1, cx); y0 = Math.min(y0, cy); y1 = Math.max(y1, cy);
-        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-          const nx = cx + dx, ny = cy + dy;
-          if (nx < 0 || ny < 0 || nx >= gx || ny >= gy) continue;
-          const v = ny * gx + nx;
-          if (grade[v] && !vis[v]) { vis[v] = 1; pilha.push(v); }
-        }
-      }
-      caixas.push({ x0: x0 * cel, y0: y0 * cel, x1: Math.min(cw, (x1 + 1) * cel), y1: Math.min(ch, (y1 + 1) * cel), n });
-    }
-    // Junta caixas que se sobrepõem
-    let mudou = true;
-    while (mudou) {
-      mudou = false;
-      for (let a = 0; a < caixas.length && !mudou; a++) for (let b = a + 1; b < caixas.length; b++) {
-        const A = caixas[a], B = caixas[b];
-        if (A.x0 <= B.x1 && B.x0 <= A.x1 && A.y0 <= B.y1 && B.y0 <= A.y1) {
-          A.x0 = Math.min(A.x0, B.x0); A.y0 = Math.min(A.y0, B.y0); A.x1 = Math.max(A.x1, B.x1); A.y1 = Math.max(A.y1, B.y1); A.n += B.n;
-          caixas.splice(b, 1); mudou = true; break;
-        }
-      }
-    }
-    caixas = caixas.filter((c) => (c.x1 - c.x0) / S >= 4 || (c.y1 - c.y0) / S >= 4);
-    const out = [];
-    for (const c of caixas) {
-      const w = c.x1 - c.x0, h = c.y1 - c.y0;
-      const recorte = document.createElement('canvas');
-      recorte.width = w; recorte.height = h;
-      recorte.getContext('2d').drawImage(canvas, c.x0, c.y0, w, h, 0, 0, w, h);
-      const tipo = w * h > 400000 ? 'image/jpeg' : 'image/png';
-      const blob = await new Promise((r) => recorte.toBlob(r, tipo, 0.9));
-      out.push({ x: c.x0 / S, y: c.y0 / S, w: w / S, h: h / S, bytes: new Uint8Array(await blob.arrayBuffer()) });
-    }
-    return out;
   }
 
   // ---------------------------------------------------------------------
@@ -347,9 +637,10 @@
   // ---------------------------------------------------------------------
   // 4) Classificação das linhas e montagem de parágrafos
   // ---------------------------------------------------------------------
-  function classificar(L, M) {
+  function classificar(L, M, celula) {
     const segs = L.segs;
     if (!segs.length) { L.tipo = 'vazia'; return; }
+    if (celula && segs.length >= 2) { L.tipo = 'texto'; return; }
     const ult = segs[segs.length - 1];
     if (segs.length >= 2 && RE_NUM_PAG.test(ult.texto) && (ult.lider || ult.x1 > M.MR - 3 * L.tam)) { L.tipo = 'sumario'; return; }
     if (segs.length >= 2) { L.tipo = 'tab'; return; }
@@ -381,26 +672,40 @@
     return (w.length / Math.max(1, it.str.length)) * it.largura;
   }
 
-  function montarParagrafos(pg, M) {
+  // Monta a sequência de blocos (parágrafos, sumário, tabelas, figuras) na ordem da página
+  function montarBlocos(linhas, M, extras, celula) {
     const blocos = [];
-    const corpo = pg.linhas.filter((L) => !L.hf);
-    corpo.forEach((L) => classificar(L, M));
+    const corpo = linhas.filter((L) => !L.hf);
+    corpo.forEach((L) => classificar(L, M, celula));
+    const seq = [
+      ...corpo.map((L) => ({ k: L.base - 0.7 * L.tam, L })),
+      ...extras.map((B) => ({ k: B.y0, B })),
+    ].sort((a, b) => a.k - b.k);
     let P = null;
     const fecha = () => { if (P) blocos.push(P); P = null; };
-    for (let i = 0; i < corpo.length; i++) {
-      const L = corpo[i];
+    for (let i = 0; i < seq.length; i++) {
+      const { L, B } = seq[i];
+      if (B) { fecha(); blocos.push(B); continue; }
       if (L.tipo === 'vazia') continue;
-      if (L.tipo === 'sumario' || L.tipo === 'tab') {
+      if (L.tipo === 'sumario') { fecha(); blocos.push({ tipo: 'sumario', linhas: [L] }); continue; }
+      if (L.tipo === 'tab') {
         fecha();
-        // Linhas tabuladas seguidas viram tabela
-        if (L.tipo === 'tab') {
-          const grupo = [L];
-          while (i + 1 < corpo.length && corpo[i + 1].tipo === 'tab' && corpo[i + 1].segs.length === L.segs.length
-            && corpo[i + 1].base - grupo[grupo.length - 1].base < 3.5 * L.tam) grupo.push(corpo[++i]);
-          if (grupo.length >= 2 && colunasAlinhadas(grupo)) { blocos.push({ tipo: 'tabela', linhas: grupo }); continue; }
-          i -= grupo.length - 1;
+        // Linhas em colunas seguidas viram tabela (inclui linhas que continuam uma célula)
+        const grupo = [L];
+        let j = i + 1;
+        const xMin = () => Math.min(...grupo.map((g) => g.x0)), xMax = () => Math.max(...grupo.map((g) => g.x1));
+        while (j < seq.length && seq[j].L) {
+          const C = seq[j].L, ant = grupo[grupo.length - 1];
+          const gap = C.base - ant.base;
+          if (gap > 2.8 * Math.max(C.tam, ant.tam) || Math.abs(C.tam - ant.tam) > 3) break;
+          if (C.tipo === 'tab') { grupo.push(C); j++; continue; }
+          if ((C.tipo === 'texto' || C.tipo === 'lista') && C.x0 >= xMin() - 2 && C.x1 <= xMax() + 2 && C.x1 - C.x0 < (xMax() - xMin()) * 0.6
+            && j + 1 < seq.length && seq[j + 1].L && seq[j + 1].L.tipo === 'tab' || (gap < 1.5 * C.tam && C.x0 > xMin() + 4 && C.x1 <= xMax() + 2)) { grupo.push(C); j++; continue; }
+          break;
         }
-        blocos.push({ tipo: L.tipo, linhas: [L] });
+        const T = grupo.length >= 2 ? tabelaDeTexto(grupo) : null;
+        if (T) { blocos.push(T); i = j - 1; continue; }
+        blocos.push({ tipo: 'tab', linhas: [L] });
         continue;
       }
       if (P && podeJuntar(P, L, M)) { P.linhas.push(L); continue; }
@@ -411,15 +716,139 @@
     return blocos;
   }
 
-  function colunasAlinhadas(grupo) {
-    const n = grupo[0].segs.length;
-    for (let c = 0; c < n; c++) {
-      const x0s = grupo.map((L) => L.segs[c].x0), x1s = grupo.map((L) => L.segs[c].x1);
-      const esq = Math.max(...x0s) - Math.min(...x0s) < 2 * grupo[0].tam;
-      const dir = Math.max(...x1s) - Math.min(...x1s) < 2 * grupo[0].tam;
-      if (!esq && !dir) return false;
+  // Tabela sem bordas: colunas = faixas horizontais ocupadas pelo texto
+  function tabelaDeTexto(grupo) {
+    const segsDe = (L) => (L.segs.length ? L.segs : [{ itens: L.itens, x0: L.x0, x1: L.x1 }]);
+    const ints = grupo.filter((L) => L.segs.length >= 2).flatMap((L) => L.segs.map((s) => [s.x0, s.x1])).sort((a, b) => a[0] - b[0]);
+    const cols = [];
+    for (const [a, b] of ints) { const u = cols[cols.length - 1]; if (u && a <= u[1] + 1) u[1] = Math.max(u[1], b); else cols.push([a, b]); }
+    if (cols.length < 2) return null;
+    const colDe = (s) => { const cx = (s.x0 + s.x1) / 2; return cols.findIndex((c) => cx >= c[0] - 1 && cx <= c[1] + 1); };
+    const rows = [];
+    for (const L of grupo) {
+      const segs = segsDe(L);
+      const idx = segs.map(colDe);
+      if (idx.some((k) => k < 0) || new Set(idx).size !== idx.length) return null;
+      const ant = rows[rows.length - 1];
+      const continua = ant && !idx.includes(0) && L.base - ant.ultBase < 1.5 * L.tam;
+      const row = continua ? ant : { cel: cols.map(() => []), topo: L.topo, fundo: L.fundo, ultBase: L.base };
+      if (!continua) rows.push(row);
+      segs.forEach((s, k) => row.cel[idx[k]].push(...s.itens));
+      row.topo = Math.min(row.topo, L.topo); row.fundo = Math.max(row.fundo, L.fundo); row.ultBase = L.base;
     }
-    return true;
+    if (rows.length < 2) return null;
+    const PAD = 5.4;
+    const x = cols.map((c) => c[0] - PAD);
+    x.push(cols[cols.length - 1][1] + PAD);
+    const y = [rows[0].topo - 2];
+    for (let r = 1; r < rows.length; r++) y.push((rows[r - 1].fundo + rows[r].topo) / 2);
+    y.push(rows[rows.length - 1].fundo + 2);
+    const celulas = [];
+    rows.forEach((R, r) => R.cel.forEach((its, c) => celulas.push({
+      r, c, cs: 1, rs: 1, itens: its, bordas: {},
+      fundo: its.length && !quaseBranco(its[0].fundoCor) ? hex(its[0].fundoCor) : null,
+    })));
+    return { tipo: 'grade', x, y, celulas, x0: x[0], x1: x[x.length - 1], y0: y[0], y1: y[y.length - 1], comBorda: false, margemFixa: PAD };
+  }
+
+  // Gera a tabela do Word (bordas e cores por célula, células mescladas)
+  function emitirTabela(T, M, corpoTam) {
+    const Dx = D();
+    const nr = T.y.length - 1;
+    const esq = [], topos = [];
+    for (const c of T.celulas) {
+      if (!c.itens.length) continue;
+      esq.push(Math.min(...c.itens.map((i) => i.x)) - T.x[c.c]);
+      topos.push(Math.min(...c.itens.map((i) => i.topo)) - T.y[c.r]);
+    }
+    const mL = T.margemFixa != null ? T.margemFixa : Math.max(0, Math.min(10, esq.length ? percentil(esq, 0.2) : 5.4));
+    const mT = Math.max(0, Math.min(8, topos.length ? percentil(topos, 0.2) - 0.15 * corpoTam : 1));
+    const NADA = { style: Dx.BorderStyle.NONE, size: 0, color: 'auto' };
+    const borda = (bd) => (bd ? { style: Dx.BorderStyle.SINGLE, size: Math.max(2, Math.min(96, Math.round(bd.e * 8))), color: bd.cor || '000000' } : NADA);
+
+    const celula = (c) => {
+      const xa = T.x[c.c], xb = T.x[c.c + c.cs], ya = T.y[c.r], yb = T.y[c.r + c.rs];
+      const Mc = { ML: xa + mL, MR: xb - mL };
+      const linhas = c.itens.length ? agruparLinhas(c.itens.slice()) : [];
+      const blocos = montarBlocos(linhas, Mc, [], true);
+      const filhos = [];
+      let ultimaBase = null;
+      for (const B of blocos) {
+        const L0 = B.linhas[0];
+        const antes = ultimaBase === null ? 0 : (L0.base - ultimaBase) - passoDe(B);
+        filhos.push(paragrafoTexto(B, Mc, antes));
+        ultimaBase = B.linhas[B.linhas.length - 1].base;
+      }
+      if (!filhos.length) filhos.push(new Dx.Paragraph({ children: [] }));
+      let va = Dx.VerticalAlign.TOP;
+      if (linhas.length) {
+        const gTop = Math.min(...linhas.map((l) => l.topo)) - ya, gBot = yb - Math.max(...linhas.map((l) => l.fundo));
+        if (gTop - gBot > 4 && gBot < gTop * 0.5) va = Dx.VerticalAlign.BOTTOM;
+        else if (Math.abs(gTop - gBot) < Math.max(2, 0.3 * (gTop + gBot)) && gTop > mT + 3) va = Dx.VerticalAlign.CENTER;
+      }
+      const b = c.bordas || {};
+      return new Dx.TableCell({
+        columnSpan: c.cs > 1 ? c.cs : undefined,
+        rowSpan: c.rs > 1 ? c.rs : undefined,
+        width: { size: Math.round((xb - xa) * TW), type: Dx.WidthType.DXA },
+        verticalAlign: va,
+        shading: c.fundo ? { fill: c.fundo, type: Dx.ShadingType.CLEAR, color: 'auto' } : undefined,
+        borders: { top: borda(b.top), bottom: borda(b.bottom), left: borda(b.left), right: borda(b.right) },
+        children: filhos,
+      });
+    };
+
+    const rows = [];
+    for (let r = 0; r < nr; r++) {
+      const cels = T.celulas.filter((c) => c.r === r).sort((a, b) => a.c - b.c);
+      if (!cels.length) continue;
+      rows.push(new Dx.TableRow({
+        height: { value: Math.round((T.y[r + 1] - T.y[r]) * TW), rule: Dx.HeightRule.ATLEAST },
+        children: cels.map(celula),
+      }));
+    }
+    const larguras = [];
+    for (let k = 0; k + 1 < T.x.length; k++) larguras.push(Math.round((T.x[k + 1] - T.x[k]) * TW));
+    return new Dx.Table({
+      rows,
+      columnWidths: larguras,
+      width: { size: larguras.reduce((a, b) => a + b, 0), type: Dx.WidthType.DXA },
+      layout: Dx.TableLayoutType.FIXED,
+      indent: { size: Math.round((T.x[0] - M.ML) * TW), type: Dx.WidthType.DXA },
+      borders: { top: NADA, bottom: NADA, left: NADA, right: NADA, insideHorizontal: NADA, insideVertical: NADA },
+      margins: { left: Math.round(mL * TW), right: Math.round(mL * TW), top: Math.round(mT * TW), bottom: 0 },
+    });
+  }
+
+  // Figura no meio do texto: parágrafo próprio com a imagem
+  function emitirFigura(F, M, antes, quebra) {
+    const Dx = D();
+    const centro = (M.ML + M.MR) / 2, cx = (F.x0 + F.x1) / 2;
+    let alignment = Dx.AlignmentType.LEFT, indent;
+    if (Math.abs(cx - centro) < 10) alignment = Dx.AlignmentType.CENTER;
+    else if (Math.abs(F.x1 - M.MR) < 6) alignment = Dx.AlignmentType.RIGHT;
+    else if (F.x0 - M.ML > 1.5) indent = { left: Math.round((F.x0 - M.ML) * TW) };
+    return new Dx.Paragraph({
+      alignment, indent, pageBreakBefore: quebra || undefined,
+      spacing: { before: Math.round(Math.max(0, antes) * TW), after: 0, line: 240, lineRule: Dx.LineRuleType.AUTO },
+      children: [new Dx.ImageRun({ data: F.bytes, transformation: { width: (F.x1 - F.x0) * 96 / 72, height: (F.y1 - F.y0) * 96 / 72 } })],
+    });
+  }
+
+  // Imagens soltas na página (enfeites atrás do texto; figuras com texto ao lado)
+  function imagensFlutuantes(lista) {
+    const Dx = D();
+    return lista.map((G) => new Dx.ImageRun({
+      data: G.bytes,
+      transformation: { width: (G.x1 - G.x0) * 96 / 72, height: (G.y1 - G.y0) * 96 / 72 },
+      floating: {
+        horizontalPosition: { relative: Dx.HorizontalPositionRelativeFrom.PAGE, offset: Math.round(G.x0 * EMU) },
+        verticalPosition: { relative: Dx.VerticalPositionRelativeFrom.PAGE, offset: Math.round(G.y0 * EMU) },
+        behindDocument: !G.contornar, allowOverlap: true, lockAnchor: true,
+        wrap: G.contornar ? { type: Dx.TextWrappingType.SQUARE, side: Dx.TextWrappingSide.BOTH_SIDES } : undefined,
+        margins: G.contornar ? { left: 57150, right: 57150 } : undefined,
+      },
+    }));
   }
 
   function podeJuntar(P, L, M) {
@@ -454,6 +883,7 @@
       font: it.fonte.familia, size: Math.max(2, Math.round((it.sobrescrito ? L.tam : tam) * 2)),
       bold: it.fonte.negrito, italics: it.fonte.italico, color: it.cor,
       superScript: it.sobrescrito || undefined,
+      underline: it.sublinhado ? {} : undefined,
     };
   }
 
@@ -502,7 +932,7 @@
   function passoDe(P) {
     const L0 = P.linhas[0];
     if (P.linhas.length >= 2) return P.linhas[1].base - P.linhas[0].base;
-    return L0.tam * alturaLinha(L0.fonte.familia);
+    return (L0.tamMax || L0.tam) * alturaLinha(L0.fonte.familia);
   }
 
   function alinhamento(P, M) {
@@ -584,86 +1014,36 @@
     });
   }
 
-  function tabelaNativa(P, M, graficos) {
-    const Dx = D();
-    const ls = P.linhas;
-    const n = ls[0].segs.length;
-    const PAD = 5.4; // margem interna padrão da célula no Word (0,08")
-    const inicio = [];
-    for (let c = 0; c < n; c++) inicio.push(Math.min(...ls.map((L) => L.segs[c].x0)) - PAD);
-    const fimTab = Math.max(...ls.map((L) => L.segs[n - 1].x1)) + PAD;
-    const topo = Math.min(...ls.map((L) => L.topo)) - 4, base = Math.max(...ls.map((L) => L.fundo)) + 4;
-    // Se há desenho (bordas/fundos) sobre a tabela, usa bordas nativas e tira o desenho
-    let x0 = inicio[0], x1 = fimTab, comBorda = false, bordaTopo = null, bordaFundo = null;
-    for (let g = graficos.length - 1; g >= 0; g--) {
-      const G = graficos[g];
-      const sobrep = G.x < x1 && G.x + G.w > x0 && G.y < base && G.y + G.h > topo;
-      const dentro = G.x >= x0 - 12 && G.x + G.w <= Math.max(x1, M.MR) + 12 && G.y >= topo - 12 && G.y + G.h <= base + 12;
-      if (sobrep && dentro) {
-        comBorda = true;
-        x0 = Math.min(x0, G.x); x1 = Math.max(x1, G.x + G.w);
-        bordaTopo = bordaTopo === null ? G.y : Math.min(bordaTopo, G.y);
-        bordaFundo = bordaFundo === null ? G.y + G.h : Math.max(bordaFundo, G.y + G.h);
-        graficos.splice(g, 1);
+  // Logotipos e faixas que se repetem no alto/pé das páginas vão para o cabeçalho/rodapé
+  function graficosRepetidos(paginas) {
+    const res = { cab: [], rod: [] };
+    const N = paginas.length;
+    if (N < 2) return res;
+    const zonaDe = (pg, g) => (g.y1 < Math.min(pg.H * 0.15, 120) ? 'cab' : g.y0 > pg.H - Math.min(pg.H * 0.15, 120) ? 'rod' : null);
+    const mapa = new Map();
+    paginas.forEach((pg) => {
+      for (const lista of ['figuras', 'enfeites']) for (const g of pg[lista]) {
+        const z = zonaDe(pg, g); if (!z) continue;
+        const k = z + '|' + [g.x0, g.y0, g.x1, g.y1].map((v) => Math.round(v / 4)).join(',');
+        if (!mapa.has(k)) mapa.set(k, []);
+        mapa.get(k).push({ pg, lista, g });
       }
-    }
-    if (comBorda) { inicio[0] = Math.min(inicio[0], x0); }
-    const fim = comBorda ? Math.max(fimTab, x1) : fimTab;
-    const larguras = inicio.map((x, c) => ((c + 1 < n ? inicio[c + 1] : fim) - x));
-    // Altura das linhas da tabela igual à do PDF
-    const passos = [];
-    for (let i = 1; i < ls.length; i++) passos.push(ls[i].base - ls[i - 1].base);
-    let passo = passos.length ? mediana(passos) : (ls[0].fundo - ls[0].topo) + 6;
-    let tTopo = ls[0].topo - (passo - (ls[0].fundo - ls[0].topo)) / 2;
-    if (comBorda && bordaTopo !== null) { tTopo = bordaTopo; passo = (bordaFundo - bordaTopo) / ls.length; }
-    const linhaBorda = comBorda ? { style: Dx.BorderStyle.SINGLE, size: 4, color: '000000' } : { style: Dx.BorderStyle.NONE, size: 0, color: 'FFFFFF' };
-    const borders = { top: linhaBorda, bottom: linhaBorda, left: linhaBorda, right: linhaBorda, insideHorizontal: linhaBorda, insideVertical: linhaBorda };
-    const rows = ls.map((L) => new Dx.TableRow({
-      height: { value: Math.round(passo * TW), rule: Dx.HeightRule.ATLEAST },
-      children: L.segs.map((s, c) => {
-        const fundo = s.itens[0].fundoCor;
-        const numerico = /^[\d\s.,%R$()+\-–]+$/.test(s.texto) && c > 0;
-        return new Dx.TableCell({
-          verticalAlign: Dx.VerticalAlign.CENTER,
-          width: { size: Math.round(larguras[c] * TW), type: Dx.WidthType.DXA },
-          shading: quaseBranco(fundo) ? undefined : { fill: hex(fundo), type: Dx.ShadingType.CLEAR, color: 'auto' },
-          children: [new Dx.Paragraph({
-            alignment: numerico && Math.abs(s.x1 - Math.max(...ls.map((x) => x.segs[c].x1))) < 2 && Math.abs(s.x0 - Math.min(...ls.map((x) => x.segs[c].x0))) > 2 ? Dx.AlignmentType.RIGHT : Dx.AlignmentType.LEFT,
-            spacing: { before: 0, after: 0 },
-            children: runsDe([L], { itens: () => s.itens }),
-          })],
-        });
-      }),
-    }));
-    const recuo = inicio[0] - M.ML + PAD;
-    P.topo = tTopo; P.fundo = tTopo + passo * ls.length;
-    return new Dx.Table({
-      rows, borders,
-      columnWidths: larguras.map((w) => Math.round(w * TW)),
-      width: { size: Math.round(larguras.reduce((a, b) => a + b, 0) * TW), type: Dx.WidthType.DXA },
-      indent: Math.abs(recuo) > 1 ? { size: Math.round(recuo * TW), type: Dx.WidthType.DXA } : undefined,
-      layout: Dx.TableLayoutType.FIXED,
     });
-  }
-
-  function imagensFlutuantes(graficos) {
-    const Dx = D();
-    return graficos.map((G) => new Dx.ImageRun({
-      data: G.bytes,
-      transformation: { width: G.w * 96 / 72, height: G.h * 96 / 72 },
-      floating: {
-        horizontalPosition: { relative: Dx.HorizontalPositionRelativeFrom.PAGE, offset: Math.round(G.x * EMU) },
-        verticalPosition: { relative: Dx.VerticalPositionRelativeFrom.PAGE, offset: Math.round(G.y * EMU) },
-        behindDocument: true, allowOverlap: true, lockAnchor: true,
-      },
-    }));
+    for (const [k, arr] of mapa) {
+      if (new Set(arr.map((a) => a.pg)).size < Math.max(2, Math.ceil(N * 0.5))) continue;
+      res[k.split('|')[0]].push(arr[0].g);
+      for (const a of arr) a.pg[a.lista] = a.pg[a.lista].filter((x) => x !== a.g);
+    }
+    return res;
   }
 
   // Cabeçalho/rodapé: monta a partir de uma página representativa
-  function montarHF(paginas, z, M, total) {
+  function montarHF(paginas, z, M, total, imagens) {
     const Dx = D();
+    const cls = z === 'cab' ? Dx.Header : Dx.Footer;
     const rep = paginas.find((p, i) => i > 0 && p.linhas.some((L) => L.hf === z)) || paginas.find((p) => p.linhas.some((L) => L.hf === z));
-    if (!rep) return null;
+    const flut = imagens && imagens.length ? imagensFlutuantes(imagens) : [];
+    if (!rep) return flut.length ? new cls({ children: [new Dx.Paragraph({ children: flut })] }) : null;
     const linhas = rep.linhas.filter((L) => L.hf === z);
     const paras = linhas.map((L, idx) => {
       const segs = L.segs.length ? L.segs : [{ itens: L.itens, x0: L.x0, x1: L.x1, texto: L.texto }];
@@ -707,7 +1087,7 @@
       });
       return new Dx.Paragraph({ children: filhos, alignment: al, tabStops: tabs.length ? tabs : undefined, spacing: { before: idx ? 0 : 0, after: 0 } });
     });
-    const cls = z === 'cab' ? Dx.Header : Dx.Footer;
+    if (flut.length && paras.length) flut.forEach((im) => paras[0].addChildElement(im));
     return new cls({ children: paras });
   }
 
@@ -765,11 +1145,23 @@
 
     detectarCabecalhoRodape(paginas);
     const M = calcularMargens(paginas);
-    for (const pg of paginas) pg.blocos = montarParagrafos(pg, M);
+    const repetidos = graficosRepetidos(paginas);
+    for (const pg of paginas) {
+      const corpoL = pg.linhas.filter((L) => !L.hf);
+      pg.flutuantes = [...pg.enfeites];
+      const noTexto = [];
+      for (const f of pg.figuras) {
+        // texto ao lado da figura → imagem com o texto contornando; senão, imagem no meio do texto
+        const lado = corpoL.some((L) => Math.min(L.fundo, f.y1) - Math.max(L.topo, f.y0) > 0.5 * (L.fundo - L.topo) && (L.x1 < f.x0 || L.x0 > f.x1));
+        if (lado) { f.contornar = true; pg.flutuantes.push(f); } else noTexto.push({ ...f, tipo: 'figura', linhas: [] });
+      }
+      pg.tabelas.forEach((t) => { t.linhas = []; });
+      pg.blocos = montarBlocos(pg.linhas, M, [...noTexto, ...pg.tabelas], false);
+    }
 
     // Tamanho e fonte do corpo do texto
     const porTam = new Map(), porFonte = new Map();
-    for (const pg of paginas) for (const B of pg.blocos) for (const L of B.linhas) {
+    for (const pg of paginas) for (const B of pg.blocos) for (const L of (B.linhas || [])) {
       porTam.set(L.tam, (porTam.get(L.tam) || 0) + L.texto.length);
       porFonte.set(L.fonte.familia, (porFonte.get(L.fonte.familia) || 0) + L.texto.length);
     }
@@ -777,8 +1169,8 @@
     const corpoFonte = porFonte.size ? [...porFonte.entries()].sort((a, b) => b[1] - a[1])[0][0] : 'Calibri';
     nivelTitulos(paginas, corpoTam);
 
-    const cab = montarHF(paginas, 'cab', M, paginas.length);
-    const rod = montarHF(paginas, 'rod', M, paginas.length);
+    const cab = montarHF(paginas, 'cab', M, paginas.length, repetidos.cab);
+    const rod = montarHF(paginas, 'rod', M, paginas.length, repetidos.rod);
     const primeiraSemCab = paginas.length > 1 && (
       (cab && !paginas[0].linhas.some((L) => L.hf === 'cab')) || (rod && !paginas[0].linhas.some((L) => L.hf === 'rod')));
 
@@ -787,35 +1179,45 @@
     let atual = null;
     paginas.forEach((pg, idx) => {
       const filhos = [];
-      let ultimaBase = null, ultimoPasso = 0;
+      let ultimaBase = null, ultimoPasso = corpoTam * 1.2, anteriorTabela = false;
+      // Só força quebra se a página anterior do PDF terminou antes do fim (quebra intencional);
+      // se estava cheia, deixa o texto correr naturalmente (evita página quase vazia)
+      const ant = idx > 0 ? paginas[idx - 1] : null;
+      const fimAnt = ant ? Math.max(0, ...ant.blocos.map((b) => (b.linhas && b.linhas.length ? b.linhas[b.linhas.length - 1].fundo : b.y1 || 0))) : 0;
+      const forcar = ant && fimAnt < M.MB - 3 * corpoTam * 1.2;
+      const continua = ant && !forcar;
+      const quebraAqui = (bi) => forcar && bi === 0 && !(atual && atual.tamanho !== `${pg.W}x${pg.H}`);
       pg.blocos.forEach((B, bi) => {
-        const L0 = B.linhas[0];
-        const passo = B.tipo === 'tabela' ? 0 : passoDe(B);
-        let antes;
-        if (ultimaBase === null) antes = L0.topo - M.MT;
-        else antes = (L0.base - ultimaBase) - passo;
-        B.quebra = idx > 0 && bi === 0 && !(atual && atual.tamanho !== `${pg.W}x${pg.H}`);
-        const extras = null;
-        if (B.tipo === 'tabela') {
-          const tabela = tabelaNativa(B, M, pg.graficos);
-          // fim do bloco anterior ≈ linha de base + parte de baixo da linha
+        B.quebra = quebraAqui(bi);
+        if (B.tipo === 'grade' || B.tipo === 'figura') {
           const fimAnterior = ultimaBase === null ? M.MT : ultimaBase + 0.25 * ultimoPasso;
-          const vazio = B.topo - fimAnterior;
-          if (vazio > 1 || B.quebra) filhos.push(new Dx.Paragraph({ spacing: { before: 0, after: 0, line: Math.round(Math.max(1, vazio) * TW), lineRule: Dx.LineRuleType.EXACT }, pageBreakBefore: B.quebra || undefined, children: [] }));
-          filhos.push(tabela);
-        } else if (B.tipo === 'sumario' || B.tipo === 'tab') filhos.push(paragrafoTabulado(B, M, antes, extras));
-        else filhos.push(paragrafoTexto(B, M, antes, extras));
-        const Lu = B.linhas[B.linhas.length - 1];
-        // depois de uma tabela, a "linha de base" equivalente fica de modo que o próximo cálculo de espaço dê certo
-        ultimaBase = B.tipo === 'tabela' ? B.fundo - 0.25 * corpoTam * 1.2 : Lu.base;
-        ultimoPasso = B.tipo === 'tabela' ? corpoTam * 1.2 : passo;
+          const vazio = ultimaBase === null && continua ? 0 : B.y0 - fimAnterior;
+          if (B.tipo === 'grade') {
+            if (vazio > 1 || B.quebra || anteriorTabela) {
+              filhos.push(new Dx.Paragraph({ spacing: { before: 0, after: 0, line: Math.round(Math.max(1, vazio) * TW), lineRule: Dx.LineRuleType.EXACT }, pageBreakBefore: B.quebra || undefined, children: [] }));
+            }
+            filhos.push(emitirTabela(B, M, corpoTam));
+          } else filhos.push(emitirFigura(B, M, vazio, B.quebra));
+          ultimaBase = B.y1 - 0.25 * corpoTam * 1.2;
+          ultimoPasso = corpoTam * 1.2;
+          anteriorTabela = B.tipo === 'grade';
+          return;
+        }
+        anteriorTabela = false;
+        const L0 = B.linhas[0];
+        const passo = passoDe(B);
+        const antes = ultimaBase === null ? (continua ? 0 : L0.topo - M.MT) : (L0.base - ultimaBase) - passo;
+        if (B.tipo === 'sumario' || B.tipo === 'tab') filhos.push(paragrafoTabulado(B, M, antes));
+        else filhos.push(paragrafoTexto(B, M, antes));
+        ultimaBase = B.linhas[B.linhas.length - 1].base;
+        ultimoPasso = passo;
       });
-      // Imagens/desenhos da página: ancorados no primeiro parágrafo dela
-      if (pg.graficos.length) {
-        const imgs = imagensFlutuantes(pg.graficos);
+      // Imagens soltas da página: ancoradas no primeiro parágrafo dela
+      if (pg.flutuantes.length) {
+        const imgs = imagensFlutuantes(pg.flutuantes);
         const idxPar = filhos.findIndex((f) => f instanceof Dx.Paragraph);
-        if (idxPar >= 0) filhos[idxPar].addChildElement ? imgs.forEach((im) => filhos[idxPar].addChildElement(im)) : null;
-        else filhos.push(new Dx.Paragraph({ children: imgs, pageBreakBefore: idx > 0 || undefined }));
+        if (idxPar >= 0) imgs.forEach((im) => filhos[idxPar].addChildElement(im));
+        else filhos.unshift(new Dx.Paragraph({ children: imgs, pageBreakBefore: idx > 0 || undefined }));
       }
       if (!filhos.length) filhos.push(new Dx.Paragraph({ children: [], pageBreakBefore: idx > 0 || undefined }));
 
@@ -827,9 +1229,10 @@
       atual.filhos.push(...filhos);
     });
 
-    const folga = corpoTam * 1.5; // evita que uma diferença mínima de fonte empurre a última linha para outra página
+    const folga = corpoTam * 0.5; // pequena tolerância para diferenças de medida das fontes
     const doc = new Dx.Document({
       title: titulo,
+      compatabilityModeVersion: 15,
       styles: {
         default: {
           document: { run: { font: corpoFonte, size: Math.round(corpoTam * 2) }, paragraph: { spacing: { before: 0, after: 0 } } },

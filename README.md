@@ -15,8 +15,10 @@ Os arquivos **não são enviados para nenhum servidor**: tudo acontece no seu co
 - **Word editável** (padrão): o texto vira parágrafos normais do Word (sem caixas de texto), com a mesma fonte, tamanho, cor, alinhamento, recuos e espaçamentos. O conversor reconhece:
   - **cabeçalho e rodapé**: linhas que se repetem no topo/pé das páginas vão para o cabeçalho/rodapé do Word, com o número da página como campo automático ("Página 1 de 5");
   - **sumário/índice**: título, linha pontilhada e número da página viram tabulação com pontilhado, alinhada à direita;
-  - **títulos** (Título 1, 2 e 3 do Word, aparecem no painel de navegação), **listas** com marcador e **tabelas** nativas, com cor de fundo das células;
-  - imagens, logotipos e desenhos ficam na mesma posição da página.
+  - **títulos** (Título 1, 2 e 3 do Word, aparecem no painel de navegação) e **listas** com marcador;
+  - **tabelas** nativas do Word, lidas das linhas de grade do PDF: células mescladas, células vazias, cor de fundo e bordas (espessura e cor) de cada célula. Tabelas sem bordas são reconhecidas pelo alinhamento das colunas;
+  - **imagens e gráficos** são localizados pelos comandos de desenho do PDF e entram como imagem no meio do texto, na posição certa (com os rótulos do gráfico juntos). Se há texto ao lado, a imagem fica com o texto contornando;
+  - logotipos que se repetem no topo/rodapé vão para o cabeçalho/rodapé; textos sublinhados viram sublinhado do Word.
 - **Cópia idêntica**: cada página vira uma imagem de alta resolução no Word. Fica 100% igual, mas não dá para editar o texto. Use para PDFs escaneados.
 
 ### Word → PDF
