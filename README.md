@@ -12,7 +12,11 @@ Os arquivos **não são enviados para nenhum servidor**: tudo acontece no seu co
 3. O arquivo convertido é baixado automaticamente.
 
 ### PDF → Word
-- **Editável, com o mesmo visual** (padrão): cada linha de texto vira texto editável, na mesma posição, fonte, tamanho e cor. Imagens, tabelas, linhas e fundos coloridos ficam como fundo da página, então o visual é o mesmo do PDF.
+- **Word editável** (padrão): o texto vira parágrafos normais do Word (sem caixas de texto), com a mesma fonte, tamanho, cor, alinhamento, recuos e espaçamentos. O conversor reconhece:
+  - **cabeçalho e rodapé**: linhas que se repetem no topo/pé das páginas vão para o cabeçalho/rodapé do Word, com o número da página como campo automático ("Página 1 de 5");
+  - **sumário/índice**: título, linha pontilhada e número da página viram tabulação com pontilhado, alinhada à direita;
+  - **títulos** (Título 1, 2 e 3 do Word, aparecem no painel de navegação), **listas** com marcador e **tabelas** nativas, com cor de fundo das células;
+  - imagens, logotipos e desenhos ficam na mesma posição da página.
 - **Cópia idêntica**: cada página vira uma imagem de alta resolução no Word. Fica 100% igual, mas não dá para editar o texto. Use para PDFs escaneados.
 
 ### Word → PDF
@@ -22,7 +26,7 @@ Os arquivos **não são enviados para nenhum servidor**: tudo acontece no seu co
 ## Limites
 - Arquivos `.doc` antigos precisam ser salvos como `.docx` antes.
 - Para o Word → PDF ficar idêntico, o computador precisa ter as fontes usadas no documento (no Windows com Office, já tem).
-- No PDF → Word editável, o texto é posicionado linha a linha (caixas de texto), não em parágrafos corridos. É o que garante o mesmo visual.
+- PDF → Word: textos em duas colunas, girados ou dentro de desenhos complexos podem não ser reconstruídos perfeitamente (texto girado fica como imagem).
 
 ## Publicação (GitHub Pages)
 Settings → Pages → *Deploy from a branch* → escolha o branch com estes arquivos e a pasta `/ (root)`.
