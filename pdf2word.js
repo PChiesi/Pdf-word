@@ -25,7 +25,7 @@
     [/^dejavusans/i, 'DejaVu Sans'],
   ];
   // Altura da linha "simples" do Word, em múltiplos do tamanho da fonte
-  const ALTURA_LINHA = { 'Calibri': 1.22, 'Cambria': 1.17, 'Arial': 1.15, 'Times New Roman': 1.15, 'Aptos': 1.2,
+  const ALTURA_LINHA = { 'Arial Narrow': 1.15, 'Calibri': 1.22, 'Cambria': 1.17, 'Arial': 1.15, 'Times New Roman': 1.15, 'Aptos': 1.2,
     'Segoe UI': 1.33, 'Verdana': 1.22, 'Tahoma': 1.21, 'Georgia': 1.14, 'Courier New': 1.13, 'Garamond': 1.12 };
   const alturaLinha = (fam) => ALTURA_LINHA[fam] || 1.17;
 
@@ -92,7 +92,7 @@
   // ---------------------------------------------------------------------
   const RE_LIDER = /^[\s.·•…_\-–]*$/;            // só pontinhos/tracinhos (linha guia do sumário)
   const RE_MARCADOR = /^[•●○◦▪■□►▸‣⁃–\-*]$/;
-  const RE_NUM_LISTA = /^(\d{1,3}[.)]|[a-zA-Z][.)]|[ivxIVX]{1,4}[.)])$/;
+  const RE_NUM_LISTA = /^(\(?\d{1,3}(\.\d{1,3}){0,5}\.?\)?|\(?[a-zA-Z][.)]|\(?[ivxlcdmIVXLCDM]{1,6}[.)]|[ivxlcdmIVXLCDM]{1,6}\s*[-–—]|\d{1,3}\s*[-–—]|\d{1,3}[ºª°]\.?|§\s*\d+[ºª°]?)$/;
   const RE_NUM_PAG = /^(\d{1,4}|[ivxlcdm]{1,6})$/i;
   const chave = (t) => t.toLowerCase().replace(/\d+/g, '#').replace(/\s+/g, ' ').trim();
   const percentil = (v, p) => { if (!v.length) return null; const s = [...v].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.max(0, Math.round((s.length - 1) * p)))]; };
@@ -148,6 +148,21 @@
       it.fundoCor = a ? a.fundo : [255, 255, 255];
     }
 
+    // Links (sumário, referências internas e endereços da internet)
+    const links = [];
+    try {
+      for (const a of await page.getAnnotations({ intent: 'display' })) {
+        if (a.subtype !== 'Link' || !(a.url || a.unsafeUrl || a.dest)) continue;
+        const r = vp.convertToViewportRectangle(a.rect);
+        links.push({ x0: Math.min(r[0], r[2]), y0: Math.min(r[1], r[3]), x1: Math.max(r[0], r[2]), y1: Math.max(r[1], r[3]), url: a.url || a.unsafeUrl || null, dest: a.dest || null });
+      }
+    } catch (e) { /* sem anotações */ }
+    for (const it of itens) {
+      const cx = it.x + it.largura / 2, cy = (it.topo + it.fundo) / 2;
+      const lk = links.find((l) => cx >= l.x0 - 1 && cx <= l.x1 + 1 && cy >= l.y0 - 1 && cy <= l.y1 + 1);
+      if (lk) it.link = lk;
+    }
+
     // Desenhos vetoriais e imagens, lidos dos comandos do PDF
     const ops = await page.getOperatorList();
     const G = analisarOperadores(ops, vp.transform, W, H);
@@ -186,12 +201,15 @@
 
     for (const T of tabelas) prepararGrade(T, limpos, orig, S, canvas.width, canvas.height);
     for (const f of figuras) f.bytes = await recortar(canvas, orig, S, f, false);
-    for (const e of enfeites) e.bytes = await recortar(limpa, limpos, S, e, true);
+    for (const e of enfeites) {
+      if (e.quadro) aparenciaQuadro(e, limpos, orig, S, canvas.width, canvas.height);
+      e.bytes = await recortar(limpa, limpos, S, e, true);
+    }
 
     const linhas = agruparLinhas(corpo);
     page.cleanup();
     return {
-      num, W, H, linhas, previa: canvas, temTexto: itens.length > 0,
+      num, W, H, linhas, links, previa: canvas, temTexto: itens.length > 0,
       tabelas: tabelas.filter((t) => t.celulas.some((c) => c.itens.length) || t.celulas.length > 1),
       figuras: figuras.filter((f) => f.bytes), enfeites: enfeites.filter((e) => e.bytes),
     };
@@ -335,7 +353,7 @@
     G.hs = G.hs.filter((h) => {
       if (h.e > 1.6) return true;
       const alvo = itens.filter((it) => h.y >= it.base - 0.5 && h.y <= it.base + 0.3 * it.tam
-        && it.x >= h.x0 - 1.5 && it.x + it.largura <= h.x1 + 1.5);
+        && Math.min(h.x1, it.x + it.largura) - Math.max(h.x0, it.x) >= 0.7 * it.largura);
       if (!alvo.length) return true;
       const cob = alvo.reduce((s, it) => s + it.largura, 0);
       if (cob < (h.x1 - h.x0) * 0.6) return true;
@@ -425,7 +443,7 @@
     for (const v of G.vs) if (!v.usada) els.push({ x0: v.x - v.e / 2 - 0.5, x1: v.x + v.e / 2 + 0.5, y0: v.y0, y1: v.y1, lin: true });
     // Imagens/desenhos dentro de tabelas ficam soltos (não juntam com a tabela)
     const perto = (a, b, d) => a.x0 <= b.x1 + d && b.x0 <= a.x1 + d && a.y0 <= b.y1 + d && b.y0 <= a.y1 + d;
-    let grupos = els.map((e) => ({ x0: e.x0, y0: e.y0, x1: e.x1, y1: e.y1, img: !!e.img, des: !!e.des, rets: e.ret ? 1 : 0, area: (e.x1 - e.x0) * (e.y1 - e.y0) }));
+    let grupos = els.map((e) => ({ x0: e.x0, y0: e.y0, x1: e.x1, y1: e.y1, img: !!e.img, des: !!e.des, rets: e.ret ? 1 : 0, lins: e.lin ? 1 : 0, area: (e.x1 - e.x0) * (e.y1 - e.y0) }));
     let mudou = true;
     while (mudou) {
       mudou = false;
@@ -434,7 +452,7 @@
         // só junta peças de um mesmo desenho: encostadas, ou uma dentro da outra
         if (!perto(A, B, 4)) continue;
         A.x0 = Math.min(A.x0, B.x0); A.y0 = Math.min(A.y0, B.y0); A.x1 = Math.max(A.x1, B.x1); A.y1 = Math.max(A.y1, B.y1);
-        A.img = A.img || B.img; A.des = A.des || B.des; A.rets += B.rets; A.area += B.area;
+        A.img = A.img || B.img; A.des = A.des || B.des; A.rets += B.rets; A.lins += B.lins; A.area += B.area;
         grupos.splice(b, 1); mudou = true; break;
       }
     }
@@ -450,7 +468,9 @@
       const densidade = areaTexto / Math.max(1, w * h);
       const grande = w * h > W * H * 0.6;
       const ehFigura = !grande && (g.img || g.des || g.rets >= 3) && densidade < 0.3 && w > 6 && h > 6;
-      (ehFigura ? figuras : enfeites).push({ x0: g.x0, y0: g.y0, x1: g.x1, y1: g.y1, grafico: !g.img && (g.des || g.rets >= 3) });
+      // quadro = só retângulos/linhas (faixa cinza atrás de título, moldura em volta de texto)
+      const quadro = !g.img && !g.des && g.rets <= 2 && w > 20 && h > 6;
+      (ehFigura ? figuras : enfeites).push({ x0: g.x0, y0: g.y0, x1: g.x1, y1: g.y1, grafico: !g.img && (g.des || g.rets >= 3), quadro });
     }
     // Rótulos de gráfico colados no desenho (eixos, categorias) entram na figura
     for (let volta = 0; volta < 2; volta++) for (const f of figuras) {
@@ -465,6 +485,27 @@
       }
     }
     return { figuras, enfeites };
+  }
+
+  // Cor de fundo e borda (cor e espessura) de um quadro/faixa
+  function aparenciaQuadro(e, limpos, orig, S, cw, ch) {
+    const px = (d, x, y) => { const X = Math.max(0, Math.min(cw - 1, Math.round(x * S))), Y = Math.max(0, Math.min(ch - 1, Math.round(y * S))); const i = (Y * cw + X) * 4; return [d.data[i], d.data[i + 1], d.data[i + 2]]; };
+    const r = [], g = [], b = [];
+    for (let k = 1; k <= 7; k++) for (let m = 1; m <= 3; m++) {
+      const p = px(limpos, e.x0 + 3 + (e.x1 - e.x0 - 6) * k / 8, e.y0 + 3 + (e.y1 - e.y0 - 6) * m / 4);
+      r.push(p[0]); g.push(p[1]); b.push(p[2]);
+    }
+    const fundo = [mediana(r), mediana(g), mediana(b)];
+    e.fundo = quaseBranco(fundo) ? null : hex(fundo);
+    // borda: anda da beira para dentro (no meio da altura) até voltar à cor do fundo
+    const yM = (e.y0 + e.y1) / 2;
+    let esp = 0, cor = null;
+    for (let d = 0; d < 6; d += 1 / S) {
+      const p = px(orig, e.x0 + d, yM);
+      const dif = Math.abs(p[0] - fundo[0]) + Math.abs(p[1] - fundo[1]) + Math.abs(p[2] - fundo[2]);
+      if (dif > 60) { esp = d + 1 / S; if (!cor || p[0] + p[1] + p[2] < cor[0] + cor[1] + cor[2]) cor = p; } else if (esp) break;
+    }
+    e.borda = esp > 0 && cor ? { e: Math.max(0.25, esp - 1 / S), cor: hex(cor) } : null; // desconta a suavização da borda
   }
 
   // Fundo e bordas das células (cores lidas da página)
@@ -552,7 +593,9 @@
     let seg = null, liderAntes = false;
     for (const it of L.itens) {
       if (it.lider || (RE_LIDER.test(it.str) && it.str.replace(/\s/g, '').length >= 3)) { liderAntes = true; continue; }
-      if (!seg || liderAntes || it.x - seg.x1 > 2.2 * L.tam) {
+      const gap = seg ? it.x - seg.x1 : 0;
+      const aposNumero = seg && seg.itens.length && RE_NUM_LISTA.test(textoItens(seg.itens)) && gap > 0.6 * L.tam;
+      if (!seg || liderAntes || gap > 2.2 * L.tam || aposNumero) {
         seg = { itens: [], x0: it.x, x1: it.x + it.largura, lider: liderAntes };
         L.segs.push(seg);
       }
@@ -560,13 +603,29 @@
       liderAntes = false;
     }
     for (const s of L.segs) s.texto = textoItens(s.itens);
+    // pontinhos soltos (linha guia picada em vários pedaços) não são texto
+    for (let k = 0; k < L.segs.length; k++) {
+      if (/^[\s.·…_]+$/.test(L.segs[k].texto) && k < L.segs.length - 1) {
+        L.segs[k + 1].lider = true;
+        L.segs.splice(k, 1); k--;
+      }
+    }
+    for (const s of L.segs) s.itens = s.itens.filter((i) => !/^[\s.·…_]{2,}$/.test(i.str) || s.itens.length === 1);
     L.texto = L.segs.map((s) => s.texto).join(' ');
+  }
+
+  // Espaço entre dois pedaços de texto: pela distância, ou depois de número de item ("18.22." / "j)") colado na letra
+  const RE_FIM_NUM = /(^|\s)(\(?\d{1,3}(\.\d{1,3}){0,5}[.)]|\(?[a-zA-Z]\)|[ivxlcdmIVXLCDM]{1,6}[.)])$/;
+  function precisaEspaco(antes, it, fim) {
+    if (fim === null || /\s$/.test(antes) || /^\s/.test(it.str)) return false;
+    if (it.x - fim > 0.12 * it.tam) return true;
+    return RE_FIM_NUM.test(antes) && /^[A-Za-zÀ-ÿ(“"]/.test(it.str);
   }
 
   function textoItens(itens) {
     let t = '', fim = null;
     for (const it of itens) {
-      if (fim !== null && it.x - fim > 0.12 * it.tam && !/\s$/.test(t) && !/^\s/.test(it.str)) t += ' ';
+      if (precisaEspaco(t, it, fim)) t += ' ';
       t += it.str; fim = it.x + it.largura;
     }
     return t.replace(/\s+/g, ' ').trim();
@@ -643,6 +702,16 @@
     if (celula && segs.length >= 2) { L.tipo = 'texto'; return; }
     const ult = segs[segs.length - 1];
     if (segs.length >= 2 && RE_NUM_PAG.test(ult.texto) && (ult.lider || ult.x1 > M.MR - 3 * L.tam)) { L.tipo = 'sumario'; return; }
+    // Item numerado/marcado com espaço grande até o texto (ex.: "2.1.1   Texto", "a)   Texto")
+    const s0 = segs[0].texto.trim();
+    if (segs.length === 2 && s0.length <= 10 && (RE_MARCADOR.test(s0) || RE_NUM_LISTA.test(s0))) {
+      const its0 = segs[0].itens;
+      L.tipo = 'lista';
+      L.marcador = { ...its0[0], str: s0, x: segs[0].x0, largura: segs[0].x1 - segs[0].x0 };
+      L.textoX = segs[1].x0;
+      L.itens = L.itens.filter((i) => !its0.includes(i));
+      return;
+    }
     if (segs.length >= 2) { L.tipo = 'tab'; return; }
     // Lista: marcador sozinho seguido de texto
     const it = L.itens;
@@ -883,7 +952,7 @@
       font: it.fonte.familia, size: Math.max(2, Math.round((it.sobrescrito ? L.tam : tam) * 2)),
       bold: it.fonte.negrito, italics: it.fonte.italico, color: it.cor,
       superScript: it.sobrescrito || undefined,
-      underline: it.sublinhado ? {} : undefined,
+      underline: it.sublinhado ? { type: D().UnderlineType.SINGLE } : undefined,
     };
   }
 
@@ -896,7 +965,8 @@
       else pedacos.push({ texto, est });
     };
     linhas.forEach((L, li) => {
-      const itens = (opts.itens && opts.itens(L)) || L.itens.filter((i) => i !== L.marcador && !i.lider && !(RE_LIDER.test(i.str) && i.str.replace(/\s/g, '').length >= 3));
+      const itens0 = (opts.itens && opts.itens(L)) || L.itens.filter((i) => i !== L.marcador && !i.lider && !(RE_LIDER.test(i.str) && i.str.replace(/\s/g, '').length >= 3));
+      const itens = itens0;
       let fim = null;
       if (li > 0 && pedacos.length) {
         const u = pedacos[pedacos.length - 1];
@@ -905,8 +975,8 @@
         else if (!/\s$/.test(u.texto)) u.texto += ' ';
       }
       for (const it of itens) {
-        const est = estiloRun(it, L);
-        if (fim !== null && it.x - fim > 0.12 * it.tam && pedacos.length && !/\s$/.test(pedacos[pedacos.length - 1].texto) && !/^\s/.test(it.str)) {
+        const est = { ...estiloRun(it, L), lk: it.link ? linkId(it.link) : 0 };
+        if (pedacos.length && precisaEspaco(pedacos[pedacos.length - 1].texto, it, fim)) {
           pedacos[pedacos.length - 1].texto += ' ';
         }
         add(it.str, est);
@@ -914,7 +984,30 @@
       }
     });
     if (pedacos.length) pedacos[pedacos.length - 1].texto = pedacos[pedacos.length - 1].texto.replace(/\s+$/, '');
-    return pedacos.map((p) => new (D().TextRun)({ text: p.texto.replace(/ {2,}/g, ' '), ...p.est }));
+    return comLinks(pedacos.map((p) => {
+      const { lk, ...est } = p.est;
+      return { lk, run: new (D().TextRun)({ text: p.texto.replace(/ {2,}/g, ' '), ...est }) };
+    }));
+  }
+
+  // Links: agrupa runs seguidos com o mesmo link num hiperlink do Word
+  const LINKS = new Map();
+  let proxLink = 1;
+  function linkId(l) { if (!l.id) { l.id = proxLink++; LINKS.set(l.id, l); } return l.id; }
+  function comLinks(lista) {
+    const Dx = D(), out = [];
+    for (let i = 0; i < lista.length;) {
+      const lk = lista[i].lk;
+      let j = i;
+      while (j < lista.length && lista[j].lk === lk) j++;
+      const runs = lista.slice(i, j).map((x) => x.run);
+      const l = lk ? LINKS.get(lk) : null;
+      if (l && l.ancora) out.push(new Dx.InternalHyperlink({ anchor: l.ancora, children: runs }));
+      else if (l && l.url) out.push(new Dx.ExternalHyperlink({ link: l.url, children: runs }));
+      else out.push(...runs);
+      i = j;
+    }
+    return out;
   }
 
   function espacamentoLinhas(P) {
@@ -978,17 +1071,30 @@
       filhos.push(new Dx.TextRun({ ...est, children: [mk.str.trim(), new Dx.Tab()] }));
     }
     filhos.push(...runsDe(P.linhas));
+    const Q = P.quadro;
+    if (Q) {
+      // faixa/moldura: vira borda e sombreamento do próprio parágrafo, com o mesmo respiro
+      ind.right = Math.round((M.MR - (Q.x1 - Q.be - Q.padE)) * TW);
+      if (!ind.left || al.alignment === Dx.AlignmentType.CENTER || al.alignment === Dx.AlignmentType.RIGHT) ind.left = Math.round((Q.textoX - M.ML) * TW);
+    }
     const op = {
-      children: [...(extras || []), ...filhos],
+      children: [...(extras || []), ...(P.ancora ? [new Dx.Bookmark({ id: P.ancora, children: filhos })] : filhos)],
       ...al, indent: Object.keys(ind).length ? ind : undefined,
       spacing: { before: Math.round(Math.max(0, antes) * TW), after: 0, ...espacamentoLinhas(P) },
     };
+    if (Q) {
+      const lado = (sp) => (Q.borda
+        ? { style: Dx.BorderStyle.SINGLE, size: Math.max(2, Math.min(96, Math.round(Q.borda.e * 8))), color: Q.borda.cor, space: Math.round(sp) }
+        : { style: Dx.BorderStyle.SINGLE, size: 2, color: Q.fundo || 'FFFFFF', space: Math.round(sp) });
+      op.border = { top: lado(Q.padT), bottom: lado(Q.padB), left: lado(Q.padE), right: lado(Q.padE) };
+      if (Q.fundo) op.shading = { fill: Q.fundo, type: Dx.ShadingType.CLEAR, color: 'auto' };
+    }
     if (P.nivel) op.heading = [Dx.HeadingLevel.HEADING_1, Dx.HeadingLevel.HEADING_2, Dx.HeadingLevel.HEADING_3][P.nivel - 1];
     if (P.quebra) op.pageBreakBefore = true;
     return new Dx.Paragraph(op);
   }
 
-  function paragrafoTabulado(P, M, antes, extras) {
+  function paragrafoTabulado(P, M, antes, linhaExata) {
     const Dx = D();
     const L = P.linhas[0];
     const tabs = [];
@@ -1006,12 +1112,100 @@
     });
     const left = L.segs[0].x0 - M.ML;
     return new Dx.Paragraph({
-      children: [...(extras || []), ...filhos],
+      children: filhos,
       tabStops: tabs,
       indent: left > 1.5 ? { left: Math.round(left * TW) } : undefined,
-      spacing: { before: Math.round(Math.max(0, antes) * TW), after: 0 },
+      spacing: { before: Math.round(Math.max(0, antes) * TW), after: 0, ...(linhaExata ? { line: Math.round(linhaExata * TW), lineRule: Dx.LineRuleType.EXACT } : {}) },
       pageBreakBefore: P.quebra || undefined,
     });
+  }
+
+  // Faixa cinza / moldura que envolve parágrafos: vira borda e sombreamento do parágrafo
+  function quadroPara(e, linhas) {
+    const be = e.borda ? e.borda.e : 0;
+    const lim = (v) => Math.max(0, Math.min(31, v));
+    const meio = (e.x0 + e.x1) / 2;
+    const aEsq = linhas.filter((L) => !(Math.abs((L.x0 + L.x1) / 2 - meio) < 3 && L.x0 - e.x0 > 10));
+    const padE = aEsq.length ? lim(Math.min(...aEsq.map((L) => (L.marcador ? L.marcador.x : L.x0))) - e.x0 - be) : Math.min(4, lim((e.x1 - e.x0) * 0.02));
+    const textoX = e.x0 + be + padE;
+    return {
+      x0: e.x0, x1: e.x1, y0: e.y0, y1: e.y1, fundo: e.fundo, borda: e.borda, be, textoX,
+      padE,
+      padT: lim(Math.min(...linhas.map((L) => L.topo)) - e.y0 - be),
+      padB: lim(e.y1 - be - Math.max(...linhas.map((L) => L.fundo))),
+      blocos: [],
+    };
+  }
+  function aplicarQuadros(pg) {
+    const dentro = (L, e) => { const cx = (L.x0 + L.x1) / 2, cy = (L.topo + L.fundo) / 2; return cx > e.x0 && cx < e.x1 && cy > e.y0 && cy < e.y1 && L.x0 >= e.x0 - 1 && L.x1 <= e.x1 + 1; };
+    pg.enfeites = pg.enfeites.filter((e) => {
+      if (!e.quadro || (e.x1 - e.x0) * (e.y1 - e.y0) > pg.W * pg.H * 0.4) return true;
+      const blocos = pg.blocos.filter((B) => (B.tipo === 'texto' || B.tipo === 'lista') && B.linhas.every((L) => dentro(L, e)));
+      if (!blocos.length) return true;
+      // não pode haver outro texto dentro do quadro que ficaria de fora
+      const outros = pg.blocos.some((B) => !blocos.includes(B) && (B.linhas || []).some((L) => dentro(L, e)));
+      if (outros) return true;
+      const Q = quadroPara(e, blocos.flatMap((B) => B.linhas));
+      Q.blocos = blocos;
+      blocos.forEach((B) => { B.quadro = Q; });
+      return false;
+    });
+  }
+
+  // Links: destino de cada link interno vira um marcador no título; sumário sem link é ligado pelo texto
+  async function resolverLinks(pdf, paginas) {
+    let n = 0;
+    const blocosTexto = (pg) => pg.blocos.filter((B) => B.linhas && B.linhas.length && B.tipo !== 'grade');
+    const marcar = (B) => { if (!B.ancora) B.ancora = `_Ref${String(++n).padStart(4, '0')}`; return B.ancora; };
+    const cache = new Map();
+    for (const pg of paginas) for (const l of pg.links || []) {
+      if (!l.dest || l.url) continue;
+      try {
+        const chaveD = JSON.stringify(l.dest);
+        let alvo = cache.get(chaveD);
+        if (alvo === undefined) {
+          const exp = typeof l.dest === 'string' ? await pdf.getDestination(l.dest) : l.dest;
+          alvo = null;
+          if (exp && exp[0] != null) {
+            const idx = typeof exp[0] === 'object' ? await pdf.getPageIndex(exp[0]) : exp[0];
+            const tipo = exp[1] && exp[1].name;
+            let y = null;
+            if (tipo === 'XYZ' && exp[3] != null) y = exp[3];
+            else if ((tipo === 'FitH' || tipo === 'FitBH') && exp[2] != null) y = exp[2];
+            const P = paginas[idx];
+            if (P) alvo = { P, y: y == null ? null : P.H - y };
+          }
+          cache.set(chaveD, alvo);
+        }
+        if (!alvo) continue;
+        const bs = blocosTexto(alvo.P);
+        if (!bs.length) continue;
+        let B = bs[0];
+        if (alvo.y != null) {
+          const abaixo = bs.filter((b) => b.linhas[0].fundo >= alvo.y - 2);
+          B = abaixo.length ? abaixo.reduce((a, b) => (a.linhas[0].topo <= b.linhas[0].topo ? a : b)) : bs[bs.length - 1];
+        }
+        l.ancora = marcar(B);
+      } catch (e) { /* destino inválido: segue sem link */ }
+    }
+    // Sumário sem links no PDF: liga cada entrada ao título com o mesmo texto
+    const norm = (t) => t.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
+    const titulos = new Map();
+    for (const pg of paginas) for (const B of blocosTexto(pg)) {
+      if (B.tipo === 'sumario' || B.tipo === 'tab') continue;
+      const t = norm(B.linhas.map((L) => (L.marcador ? L.marcador.str + ' ' : '') + L.texto).join(' '));
+      if (t && t.length < 200 && !titulos.has(t)) titulos.set(t, B);
+    }
+    for (const pg of paginas) for (const B of pg.blocos) {
+      if (B.tipo !== 'sumario') continue;
+      const L = B.linhas[0];
+      if (L.itens.some((i) => i.link)) continue;
+      const t = norm(L.segs.slice(0, -1).map((s) => s.texto).join(' '));
+      const alvo = titulos.get(t);
+      if (!alvo) continue;
+      const l = { ancora: marcar(alvo) };
+      L.itens.forEach((i) => { i.link = l; });
+    }
   }
 
   // Logotipos e faixas que se repetem no alto/pé das páginas vão para o cabeçalho/rodapé
@@ -1042,10 +1236,26 @@
     const Dx = D();
     const cls = z === 'cab' ? Dx.Header : Dx.Footer;
     const rep = paginas.find((p, i) => i > 0 && p.linhas.some((L) => L.hf === z)) || paginas.find((p) => p.linhas.some((L) => L.hf === z));
-    const flut = imagens && imagens.length ? imagensFlutuantes(imagens) : [];
+    const linhas = rep ? rep.linhas.filter((L) => L.hf === z) : [];
+    // Moldura repetida em volta de linhas do cabeçalho vira borda do parágrafo (texto nunca fica colado)
+    const dentro = (L, e) => L.x0 >= e.x0 - 1 && L.x1 <= e.x1 + 1 && L.topo >= e.y0 - 1 && L.fundo <= e.y1 + 1;
+    const quadros = [];
+    const soltas = (imagens || []).filter((e) => {
+      if (!e.quadro) return true;
+      const ls = linhas.filter((L) => dentro(L, e));
+      if (!ls.length) return true;
+      const Q = quadroPara(e, ls);
+      Q.linhas = ls;
+      quadros.push(Q);
+      if (z === 'cab') M.cabDist = Math.min(M.cabDist, Math.max(6, e.y0));
+      else M.rodDist = Math.min(M.rodDist, Math.max(6, rep.H - e.y1));
+      return false;
+    });
+    const flut = soltas.length ? imagensFlutuantes(soltas) : [];
     if (!rep) return flut.length ? new cls({ children: [new Dx.Paragraph({ children: flut })] }) : null;
-    const linhas = rep.linhas.filter((L) => L.hf === z);
+    let baseAnt = null;
     const paras = linhas.map((L, idx) => {
+      const Q = quadros.find((q) => q.linhas.includes(L));
       const segs = L.segs.length ? L.segs : [{ itens: L.itens, x0: L.x0, x1: L.x1, texto: L.texto }];
       const filhos = [];
       const tabs = [];
@@ -1069,7 +1279,14 @@
           filhos.push(new Dx.TextRun({ children: [new Dx.Tab()] }));
         }
         let fim = null;
+        const juntos = [];
         for (const it of s.itens) {
+          const u = juntos[juntos.length - 1];
+          if (u && JSON.stringify(estiloRun(u, L)) === JSON.stringify(estiloRun(it, L)) && it.x - (u.x + u.largura) < 0.12 * it.tam) {
+            juntos[juntos.length - 1] = { ...u, str: u.str + it.str, largura: it.x + it.largura - u.x };
+          } else juntos.push(it);
+        }
+        for (const it of juntos) {
           const est = estiloRun(it, L);
           let str = it.str;
           if (fim !== null && it.x - fim > 0.12 * it.tam && !/^\s/.test(str)) str = ' ' + str;
@@ -1085,7 +1302,24 @@
           filhos.push(new Dx.TextRun({ ...est, children }));
         }
       });
-      return new Dx.Paragraph({ children: filhos, alignment: al, tabStops: tabs.length ? tabs : undefined, spacing: { before: idx ? 0 : 0, after: 0 } });
+      const op = { children: filhos, alignment: al, tabStops: tabs.length ? tabs : undefined };
+      // espaço entre as linhas igual ao do PDF
+      const antes = baseAnt === null ? 0 : (L.base - baseAnt) - (L.tamMax || L.tam) * alturaLinha(L.fonte.familia);
+      baseAnt = L.base;
+      op.spacing = { before: Math.round(Math.max(0, antes) * TW), after: 0 };
+      if (Q) {
+        op.alignment = Dx.AlignmentType.LEFT;
+        op.indent = { left: Math.round((Q.textoX - M.ML) * TW), right: Math.round((M.MR - (Q.x1 - Q.be - Q.padE)) * TW) };
+        const lado = (sp) => (Q.borda
+          ? { style: Dx.BorderStyle.SINGLE, size: Math.max(2, Math.min(96, Math.round(Q.borda.e * 8))), color: Q.borda.cor, space: Math.round(sp) }
+          : { style: Dx.BorderStyle.SINGLE, size: 2, color: Q.fundo || 'FFFFFF', space: Math.round(sp) });
+        op.border = { top: lado(Q.padT), bottom: lado(Q.padB), left: lado(Q.padE), right: lado(Q.padE) };
+        if (Q.fundo) op.shading = { fill: Q.fundo, type: Dx.ShadingType.CLEAR, color: 'auto' };
+        if (Q.linhas[0] === L && idx > 0) op.spacing.before = Math.round(Math.max(0, antes - Q.padT - Q.be) * TW);
+      } else if (al === Dx.AlignmentType.LEFT && segs[0].x0 - M.ML > 1.5) {
+        op.indent = { left: Math.round((segs[0].x0 - M.ML) * TW) };
+      }
+      return new Dx.Paragraph(op);
     });
     if (flut.length && paras.length) flut.forEach((im) => paras[0].addChildElement(im));
     return new cls({ children: paras });
@@ -1094,19 +1328,19 @@
   function nivelTitulos(paginas, corpoTam) {
     const tamanhos = new Set();
     for (const pg of paginas) for (const B of pg.blocos) {
-      if (B.tipo !== 'texto' || B.linhas.length > 3) continue;
+      if ((B.tipo !== 'texto' && B.tipo !== 'lista') || B.linhas.length > 3) continue;
       const t = B.linhas[0].tam;
       if (t >= corpoTam * 1.15) tamanhos.add(t);
     }
     const ordem = [...tamanhos].sort((a, b) => b - a);
     // O maior tamanho geralmente é o título do documento (aparece uma vez): fica fora dos níveis
     const cont = new Map();
-    for (const pg of paginas) for (const B of pg.blocos) if (B.tipo === 'texto' && tamanhos.has(B.linhas[0].tam)) cont.set(B.linhas[0].tam, (cont.get(B.linhas[0].tam) || 0) + 1);
+    for (const pg of paginas) for (const B of pg.blocos) if ((B.tipo === 'texto' || B.tipo === 'lista') && tamanhos.has(B.linhas[0].tam)) cont.set(B.linhas[0].tam, (cont.get(B.linhas[0].tam) || 0) + 1);
     let niveis = ordem;
     if (ordem.length > 1 && cont.get(ordem[0]) === 1) niveis = ordem.slice(1);
     niveis = niveis.slice(0, 3);
     for (const pg of paginas) for (const B of pg.blocos) {
-      if (B.tipo !== 'texto' || B.linhas.length > 3) continue;
+      if ((B.tipo !== 'texto' && B.tipo !== 'lista') || B.linhas.length > 3) continue;
       const k = niveis.indexOf(B.linhas[0].tam);
       if (k >= 0) B.nivel = k + 1;
     }
@@ -1146,18 +1380,23 @@
     detectarCabecalhoRodape(paginas);
     const M = calcularMargens(paginas);
     const repetidos = graficosRepetidos(paginas);
+    const corpoAprox = 12;
     for (const pg of paginas) {
       const corpoL = pg.linhas.filter((L) => !L.hf);
-      pg.flutuantes = [...pg.enfeites];
+      const laterais = [];
       const noTexto = [];
       for (const f of pg.figuras) {
         // texto ao lado da figura → imagem com o texto contornando; senão, imagem no meio do texto
         const lado = corpoL.some((L) => Math.min(L.fundo, f.y1) - Math.max(L.topo, f.y0) > 0.5 * (L.fundo - L.topo) && (L.x1 < f.x0 || L.x0 > f.x1));
-        if (lado) { f.contornar = true; pg.flutuantes.push(f); } else noTexto.push({ ...f, tipo: 'figura', linhas: [] });
+        const foraDoCorpo = f.y1 > M.MB + corpoAprox || f.y0 < M.MT - corpoAprox;
+        if (lado || foraDoCorpo) { f.contornar = true; laterais.push(f); } else noTexto.push({ ...f, tipo: 'figura', linhas: [] });
       }
       pg.tabelas.forEach((t) => { t.linhas = []; });
       pg.blocos = montarBlocos(pg.linhas, M, [...noTexto, ...pg.tabelas], false);
+      aplicarQuadros(pg);
+      pg.flutuantes = [...pg.enfeites, ...laterais];
     }
+    await resolverLinks(pdf, paginas);
 
     // Tamanho e fonte do corpo do texto
     const porTam = new Map(), porFonte = new Map();
@@ -1206,10 +1445,18 @@
         anteriorTabela = false;
         const L0 = B.linhas[0];
         const passo = passoDe(B);
-        const antes = ultimaBase === null ? (continua ? 0 : L0.topo - M.MT) : (L0.base - ultimaBase) - passo;
-        if (B.tipo === 'sumario' || B.tipo === 'tab') filhos.push(paragrafoTabulado(B, M, antes));
+        let antes = ultimaBase === null ? (continua ? 0 : L0.topo - M.MT) : (L0.base - ultimaBase) - passo;
+        const Q = B.quadro;
+        if (Q && Q.blocos[0] === B) antes -= Q.padT + Q.be;
+        if (B.tipo === 'sumario' || B.tipo === 'tab') {
+          // linhas de sumário seguidas: distância entre linhas exatamente igual à do PDF
+          const d = ultimaBase === null ? null : L0.base - ultimaBase;
+          const exato = d !== null && d > 0.8 * L0.tam && d < 2.2 * L0.tam ? d : null;
+          filhos.push(paragrafoTabulado(B, M, exato ? 0 : antes, exato));
+        }
         else filhos.push(paragrafoTexto(B, M, antes));
         ultimaBase = B.linhas[B.linhas.length - 1].base;
+        if (Q && Q.blocos[Q.blocos.length - 1] === B) ultimaBase += Q.padB + Q.be;
         ultimoPasso = passo;
       });
       // Imagens soltas da página: ancoradas no primeiro parágrafo dela
@@ -1260,7 +1507,24 @@
         children: s.filhos,
       })),
     });
-    return { blob: await Dx.Packer.toBlob(doc), semTexto: false };
+    return { blob: await corrigirMarcadores(await Dx.Packer.toBlob(doc)), semTexto: false };
+  }
+
+  // A biblioteca dá o mesmo número a todos os marcadores; o Word exige números únicos
+  async function corrigirMarcadores(blob) {
+    const zip = await JSZip.loadAsync(blob);
+    const f = zip.file('word/document.xml');
+    if (!f) return blob;
+    let xml = await f.async('string');
+    let n = 0;
+    const pilha = [];
+    xml = xml.replace(/<w:bookmark(Start|End)\b([^>]*?)w:id="\d+"([^>]*)\/>/g, (m, tipo, a, b) => {
+      let id;
+      if (tipo === 'Start') { id = ++n; pilha.push(id); } else id = pilha.length ? pilha.pop() : ++n;
+      return `<w:bookmark${tipo}${a}w:id="${id}"${b}/>`;
+    });
+    zip.file('word/document.xml', xml);
+    return zip.generateAsync({ type: 'blob', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', compression: 'DEFLATE' });
   }
 
   // Modo "cópia idêntica": cada página vira uma imagem
