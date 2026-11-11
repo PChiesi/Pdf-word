@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Conversor PDF ⇄ Word</title>
+<meta name="description" content="Converta PDF em Word e Word em PDF direto no navegador. Seus arquivos não saem do seu computador.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%232b5797'/><path d='M9 11h14M9 16h14M9 21h9' stroke='white' stroke-width='2.5' stroke-linecap='round'/></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topo">
+  <div class="marca">
+    <span class="logo" aria-hidden="true">⇄</span>
+    <div>
+      <h1>Conversor PDF ⇄ Word</h1>
+      <p>Grátis, sem cadastro. O arquivo é convertido no seu próprio navegador e <strong>não é enviado para nenhum servidor</strong>.</p>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="abas" role="tablist">
+    <button role="tab" id="aba-pdf" aria-selected="true" data-modo="pdf2word">
+      <span class="ic pdf">PDF</span> <span class="seta">→</span> <span class="ic doc">W</span>
+      <b>PDF para Word</b>
+    </button>
+    <button role="tab" id="aba-word" aria-selected="false" data-modo="word2pdf">
+      <span class="ic doc">W</span> <span class="seta">→</span> <span class="ic pdf">PDF</span>
+      <b>Word para PDF</b>
+    </button>
+  </div>
+
+  <section class="painel" id="painel">
+    <label class="soltar" id="soltar">
+      <input type="file" id="arquivo" hidden>
+      <span class="soltar-ic" aria-hidden="true">⤒</span>
+      <span class="soltar-t" id="soltar-t">Arraste o PDF aqui</span>
+      <span class="soltar-s">ou <u>clique para escolher</u></span>
+    </label>
+
+    <div class="opcoes" id="op-pdf2word">
+      <span class="op-titulo">Como você quer o Word?</span>
+      <label class="op"><input type="radio" name="m1" value="editavel" checked>
+        <span><b>Editável, com o mesmo visual</b><small>O texto vira texto de verdade, na mesma posição, fonte, tamanho e cor. Imagens, tabelas e desenhos ficam como fundo da página.</small></span></label>
+      <label class="op"><input type="radio" name="m1" value="imagem">
+        <span><b>Cópia idêntica (não editável)</b><small>Cada página entra no Word como uma imagem de alta resolução. 100% igual ao PDF.</small></span></label>
+    </div>
+
+    <div class="opcoes" id="op-word2pdf" hidden>
+      <span class="op-titulo">Como você quer o PDF?</span>
+      <label class="op"><input type="radio" name="m2" value="texto" checked>
+        <span><b>PDF com texto selecionável</b><small>Abre a janela de impressão: escolha <em>Salvar como PDF</em> e clique em Salvar.</small></span></label>
+      <label class="op"><input type="radio" name="m2" value="imagem">
+        <span><b>Baixar PDF direto</b><small>Baixa o arquivo na hora. As páginas ficam como imagem (texto não selecionável).</small></span></label>
+    </div>
+
+    <div class="progresso" id="progresso" hidden>
+      <div class="barra"><i id="barra"></i></div>
+      <span id="status">Preparando…</span>
+    </div>
+
+    <div class="pronto" id="pronto" hidden>
+      <span class="ok" aria-hidden="true">✓</span>
+      <div><b id="pronto-t">Pronto!</b><small id="pronto-s"></small></div>
+      <button class="btn" id="baixar">Baixar</button>
+      <button class="btn sec" id="outro">Converter outro</button>
+    </div>
+
+    <div class="erro" id="erro" hidden></div>
+  </section>
+
+  <section class="previa" id="previa" hidden>
+    <h2>Prévia</h2>
+    <div id="previa-conteudo"></div>
+  </section>
+
+  <section class="dicas">
+    <h2>Para o resultado ficar idêntico</h2>
+    <ul>
+      <li><b>Word para PDF:</b> use arquivos <code>.docx</code>. Tenha instaladas as mesmas fontes usadas no documento (no Windows, as do Office já estão). Arquivos <code>.doc</code> antigos: abra no Word e salve como <code>.docx</code>.</li>
+      <li><b>PDF para Word:</b> funciona com PDFs gerados por computador. PDF escaneado (foto de papel) não tem texto: use a opção <em>Cópia idêntica</em>.</li>
+      <li>Nada é enviado pela internet. Pode usar com documentos confidenciais.</li>
+    </ul>
+  </section>
+</main>
+
+<footer class="rodape">Conversor PDF ⇄ Word · funciona no Chrome, Edge, Firefox e Safari</footer>
+
+<script src="vendor/pdf.min.js"></script>
+<script src="vendor/docx.umd.js"></script>
+<script>window.DocxLib = window.docx;</script>
+<script src="vendor/jszip.min.js"></script>
+<script src="vendor/docx-preview.min.js"></script>
+<script>window.DocxPreview = window.docx;</script>
+<script src="vendor/html2canvas.min.js"></script>
+<script src="vendor/jspdf.umd.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
