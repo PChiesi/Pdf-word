@@ -85,7 +85,7 @@
     return { fundo, cor };
   }
   const hex = (c) => c.map((v) => Math.round(v).toString(16).padStart(2, '0')).join('').toUpperCase();
-  const quaseBranco = (c) => c[0] > 245 && c[1] > 245 && c[2] > 245;
+  const quaseBranco = (c) => c[0] > 250 && c[1] > 250 && c[2] > 250;
 
   // ---------------------------------------------------------------------
   // Utilidades de texto
@@ -166,8 +166,8 @@
     // Desenhos vetoriais e imagens, lidos dos comandos do PDF
     const ops = await page.getOperatorList();
     const G = analisarOperadores(ops, vp.transform, W, H);
-    marcarSublinhados(G, itens);
     const tabelas = detectarGrades(G, itens);
+    marcarSublinhados(G, itens);
     const { figuras, enfeites } = agruparGraficos(G, itens, tabelas, W, H);
 
     // Distribui o texto: figura (fica na imagem), tabela (vai para a célula) ou corpo
@@ -351,12 +351,15 @@
   // Linha fina logo abaixo de um texto = sublinhado (vira formatação, não desenho)
   function marcarSublinhados(G, itens) {
     G.hs = G.hs.filter((h) => {
-      if (h.e > 1.6) return true;
+      if (h.e > 1.6 || h.usada) return true; // linha de tabela nunca é sublinhado
       const alvo = itens.filter((it) => h.y >= it.base - 0.5 && h.y <= it.base + 0.3 * it.tam
         && Math.min(h.x1, it.x + it.largura) - Math.max(h.x0, it.x) >= 0.7 * it.largura);
       if (!alvo.length) return true;
       const cob = alvo.reduce((s, it) => s + it.largura, 0);
       if (cob < (h.x1 - h.x0) * 0.6) return true;
+      // sublinhado acompanha o texto; linha bem mais comprida que o texto é divisão, não sublinhado
+      const ini = Math.min(...alvo.map((i) => i.x)), fim = Math.max(...alvo.map((i) => i.x + i.largura));
+      if ((h.x1 - h.x0) > (fim - ini) + 1.5 * alvo[0].tam) return true;
       alvo.forEach((it) => { it.sublinhado = true; });
       return false;
     });
@@ -470,7 +473,7 @@
       const ehFigura = !grande && (g.img || g.des || g.rets >= 3) && densidade < 0.3 && w > 6 && h > 6;
       // quadro = só retângulos/linhas (faixa cinza atrás de título, moldura em volta de texto)
       const quadro = !g.img && !g.des && g.rets <= 2 && w > 20 && h > 6;
-      (ehFigura ? figuras : enfeites).push({ x0: g.x0, y0: g.y0, x1: g.x1, y1: g.y1, grafico: !g.img && (g.des || g.rets >= 3), quadro });
+      (ehFigura ? figuras : enfeites).push({ x0: g.x0, y0: g.y0, x1: g.x1, y1: g.y1, grafico: !g.img && (g.des || g.rets >= 3), quadro, temLinhas: g.lins > 0 });
     }
     // Rótulos de gráfico colados no desenho (eixos, categorias) entram na figura
     for (let volta = 0; volta < 2; volta++) for (const f of figuras) {
@@ -490,20 +493,29 @@
   // Cor de fundo e borda (cor e espessura) de um quadro/faixa
   function aparenciaQuadro(e, limpos, orig, S, cw, ch) {
     const px = (d, x, y) => { const X = Math.max(0, Math.min(cw - 1, Math.round(x * S))), Y = Math.max(0, Math.min(ch - 1, Math.round(y * S))); const i = (Y * cw + X) * 4; return [d.data[i], d.data[i + 1], d.data[i + 2]]; };
-    const r = [], g = [], b = [];
-    for (let k = 1; k <= 7; k++) for (let m = 1; m <= 3; m++) {
-      const p = px(limpos, e.x0 + 3 + (e.x1 - e.x0 - 6) * k / 8, e.y0 + 3 + (e.y1 - e.y0 - 6) * m / 4);
-      r.push(p[0]); g.push(p[1]); b.push(p[2]);
+    // fundo: a cor mais comum no interior (as letras são minoria)
+    const bins = new Map();
+    for (let k = 1; k <= 30; k++) for (let m = 1; m <= 6; m++) {
+      const p = px(orig, e.x0 + 2 + (e.x1 - e.x0 - 4) * k / 31, e.y0 + 2 + (e.y1 - e.y0 - 4) * m / 7);
+      const key = p.map((v) => v >> 2).join(',');
+      const v = bins.get(key) || [0, 0, 0, 0];
+      v[0] += p[0]; v[1] += p[1]; v[2] += p[2]; v[3]++;
+      bins.set(key, v);
     }
-    const fundo = [mediana(r), mediana(g), mediana(b)];
+    let melhor = null;
+    for (const v of bins.values()) if (!melhor || v[3] > melhor[3]) melhor = v;
+    const fundo = melhor ? [melhor[0] / melhor[3], melhor[1] / melhor[3], melhor[2] / melhor[3]] : [255, 255, 255];
     e.fundo = quaseBranco(fundo) ? null : hex(fundo);
-    // borda: anda da beira para dentro (no meio da altura) até voltar à cor do fundo
+    // borda: só quando o PDF desenhou linhas em volta (sem isso é só uma faixa de fundo)
+    e.borda = null;
+    if (!e.temLinhas) return;
     const yM = (e.y0 + e.y1) / 2;
     let esp = 0, cor = null;
     for (let d = 0; d < 6; d += 1 / S) {
-      const p = px(orig, e.x0 + d, yM);
+      const p = px(limpos, e.x0 + d, yM); // sem o texto, para não confundir letra com borda
       const dif = Math.abs(p[0] - fundo[0]) + Math.abs(p[1] - fundo[1]) + Math.abs(p[2] - fundo[2]);
-      if (dif > 60) { esp = d + 1 / S; if (!cor || p[0] + p[1] + p[2] < cor[0] + cor[1] + cor[2]) cor = p; } else if (esp) break;
+      const branco = p[0] > 250 && p[1] > 250 && p[2] > 250;
+      if (dif > 60 && !branco) { esp = d + 1 / S; if (!cor || p[0] + p[1] + p[2] < cor[0] + cor[1] + cor[2]) cor = p; } else if (esp) break;
     }
     e.borda = esp > 0 && cor ? { e: Math.max(0.25, esp - 1 / S), cor: hex(cor) } : null; // desconta a suavização da borda
   }
@@ -827,17 +839,20 @@
     const esq = [], topos = [];
     for (const c of T.celulas) {
       if (!c.itens.length) continue;
-      esq.push(Math.min(...c.itens.map((i) => i.x)) - T.x[c.c]);
+      const xa = T.x[c.c], xb = T.x[c.c + c.cs];
+      const ix0 = Math.min(...c.itens.map((i) => i.x)), ix1 = Math.max(...c.itens.map((i) => i.x + i.largura));
+      const centr = Math.abs((ix0 + ix1) / 2 - (xa + xb) / 2) < 2.5 && ix0 - xa > 4;
+      if (!centr) esq.push(ix0 - xa);
       topos.push(Math.min(...c.itens.map((i) => i.topo)) - T.y[c.r]);
     }
-    const mL = T.margemFixa != null ? T.margemFixa : Math.max(0, Math.min(10, esq.length ? percentil(esq, 0.2) : 5.4));
+    const mL = T.margemFixa != null ? T.margemFixa : Math.max(0, Math.min(8, esq.length ? percentil(esq, 0.2) : 2));
     const mT = Math.max(0, Math.min(8, topos.length ? percentil(topos, 0.2) - 0.15 * corpoTam : 1));
     const NADA = { style: Dx.BorderStyle.NONE, size: 0, color: 'auto' };
     const borda = (bd) => (bd ? { style: Dx.BorderStyle.SINGLE, size: Math.max(2, Math.min(96, Math.round(bd.e * 8))), color: bd.cor || '000000' } : NADA);
 
     const celula = (c) => {
       const xa = T.x[c.c], xb = T.x[c.c + c.cs], ya = T.y[c.r], yb = T.y[c.r + c.rs];
-      const Mc = { ML: xa + mL, MR: xb - mL };
+      const Mc = { ML: xa + mL, MR: xb - mL, celula: true };
       const linhas = c.itens.length ? agruparLinhas(c.itens.slice()) : [];
       const blocos = montarBlocos(linhas, Mc, [], true);
       const filhos = [];
@@ -938,7 +953,12 @@
     if (centrada(ult) && centrada(L)) return !cabe || true;
     if (cabe) return false;
     // Alinhamento à esquerda coerente
-    const ref = P.tipo === 'lista' ? P.linhas[0].textoX : (P.linhas.length >= 2 ? P.linhas[1].x0 : null);
+    if (P.tipo === 'lista') {
+      const L0 = P.linhas[0];
+      if (P.linhas.length === 1 && Math.abs(L.x0 - L0.marcador.x) < 1.5) { P.semRecuo = true; return true; }
+      return Math.abs(L.x0 - (P.semRecuo ? L0.marcador.x : L0.textoX)) < 1.5;
+    }
+    const ref = P.linhas.length >= 2 ? P.linhas[1].x0 : null;
     if (ref !== null) return Math.abs(L.x0 - ref) < 1.5;
     return L.x0 <= P.linhas[0].x0 + 1.5 && L.x0 >= P.linhas[0].x0 - 6 * L.tam;
   }
@@ -1032,9 +1052,11 @@
     const A = D().AlignmentType;
     const ls = P.linhas;
     const centro = (M.ML + M.MR) / 2;
-    const centrada = ls.every((L) => Math.abs((L.x0 + L.x1) / 2 - centro) < Math.max(4, 0.02 * (M.MR - M.ML)) && L.x0 > M.ML + 2 * L.tam);
+    const centrada = M.celula
+      ? ls.every((L) => Math.abs((L.x0 + L.x1) / 2 - centro) < 2.5 && L.x0 > M.ML + 1.5)
+      : ls.every((L) => Math.abs((L.x0 + L.x1) / 2 - centro) < Math.max(4, 0.02 * (M.MR - M.ML)) && L.x0 > M.ML + 2 * L.tam);
     if (centrada) return { alignment: A.CENTER };
-    const aDireita = ls.every((L) => Math.abs(L.x1 - M.MR) < 3 && L.x0 > M.ML + (M.MR - M.ML) * 0.3);
+    const aDireita = ls.every((L) => Math.abs(L.x1 - M.MR) < 3 && L.x0 > M.ML + (M.MR - M.ML) * (M.celula ? 0.1 : 0.3));
     if (aDireita) return { alignment: A.RIGHT };
     if (ls.length >= 2) {
       const meio = ls.slice(0, -1);
@@ -1048,6 +1070,7 @@
     const tw = (v) => Math.round(Math.max(0, v) * TW);
     if (P.tipo === 'lista') {
       const L0 = ls[0];
+      if (P.semRecuo) return L0.marcador.x - M.ML > 1.5 ? { left: tw(L0.marcador.x - M.ML) } : {};
       return { left: tw(L0.textoX - M.ML), hanging: tw(L0.textoX - L0.marcador.x) };
     }
     const outros = ls.length >= 2 ? Math.min(...ls.slice(1).map((L) => L.x0)) : ls[0].x0;
@@ -1077,7 +1100,10 @@
       ind.right = Math.round((M.MR - (Q.x1 - Q.be - Q.padE)) * TW);
       if (!ind.left || al.alignment === Dx.AlignmentType.CENTER || al.alignment === Dx.AlignmentType.RIGHT) ind.left = Math.round((Q.textoX - M.ML) * TW);
     }
+    // número seguido de tabulação até o texto; nas linhas seguintes o texto volta para a margem
+    const tabsLista = P.tipo === 'lista' && P.semRecuo ? [{ type: Dx.TabStopType.LEFT, position: Math.round((P.linhas[0].textoX - M.ML) * TW) }] : undefined;
     const op = {
+      tabStops: tabsLista,
       children: [...(extras || []), ...(P.ancora ? [new Dx.Bookmark({ id: P.ancora, children: filhos })] : filhos)],
       ...al, indent: Object.keys(ind).length ? ind : undefined,
       spacing: { before: Math.round(Math.max(0, antes) * TW), after: 0, ...espacamentoLinhas(P) },
